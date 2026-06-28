@@ -40,7 +40,6 @@ from shapely.geometry import LineString
 
 
 
-
 # --------------------------------------------------------------------------- #
 # Street grid                                                                  #
 # --------------------------------------------------------------------------- #
@@ -262,6 +261,7 @@ def extract_contour(svg_path, img_size):
     return _close(pts)
 
 
+
 # --------------------------------------------------------------------------- #
 # Geometry helpers                                                             #
 # --------------------------------------------------------------------------- #
@@ -289,13 +289,24 @@ def resample(pts, n=None, step=None):
     return np.column_stack([x, y])
 
 
-def place(pts, scale, rot_deg, dx, dy):
-    """Scale + rotate a polyline about its centroid, then translate."""
+def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0):
+    """Affine-place a polyline about its centroid, then translate.
+
+    Beyond similarity (scale + rot + translate) this adds two shape-fitting DOF:
+      * aspect -- area-preserving anisotropic stretch (diag(a, 1/a)); lets the
+                  shape elongate to match Manhattan's ~3:1 blocks, which both fits
+                  better and turns shallow-angle edges into aligned ones.
+      * shear  -- a small skew, for grids that aren't perfectly orthogonal.
+    aspect=1, shear=0 reduces exactly to the old similarity transform.
+    """
     pts = np.asarray(pts, dtype=np.float64)
     c = pts.mean(axis=0)
     a = np.radians(rot_deg)
-    rot = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
-    return (pts - c) * scale @ rot.T + c + np.array([dx, dy])
+    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    H = np.array([[1.0, shear], [0.0, 1.0]])
+    Sc = np.array([[scale * aspect, 0.0], [0.0, scale / aspect]])
+    M = R @ H @ Sc
+    return (pts - c) @ M.T + c + np.array([dx, dy])
 
 
 def waypoint_importance(pts, k=4):
@@ -341,6 +352,10 @@ def _score(placed, grid, scale, cfg, importance):
     if placed.min() < m or placed.max() > 1 - m:
         return -np.inf
     d, nn = grid.tree.query(placed)
+    # No-ocean guard: too much of the outline far from any street node means it
+    # spills into water / off-network void -> reject outright.
+    if np.mean(d < grid.avg_edge * cfg["land_reach"]) < cfg["min_land_fraction"]:
+        return -np.inf
     w = importance + 0.05                                  # floor: flats still count a little
     on_street = (d < grid.avg_edge * 0.5).astype(float)
     coverage = float(np.sum(w * on_street) / np.sum(w))   # importance-weighted coverage
@@ -353,18 +368,33 @@ def _score(placed, grid, scale, cfg, importance):
     # feature (e.g. both lips of a mouth) collapses onto one node it can't be drawn,
     # so this rewards placements/scales where features land on their own streets.
     resolvable = (len(np.unique(nn[feat])) / int(feat.sum())) if feat.any() else 1.0
-    # Orientation: reward rotations whose outline tangents run *along* the street
-    # grid (0 / 90 deg to it) instead of diagonally. Diagonal edges are what force
-    # the big staircases and rectangular detours, so aligning them straightens the
-    # route before any routing happens. cos(4*delta) peaks at 0/90 deg, dips at 45.
+    # Orientation: a grid renders an edge cleanly when it is EITHER exactly on an
+    # axis (0/90 deg -> a straight line) OR near 45 deg (a fine even crisscross).
+    # The ugly case is the *shallow* band in between: a ~10 deg edge staircases as
+    # cot(10 deg) ~= 6 blocks of parallel run, then one big 90 deg jog. The old
+    # term rewarded "near axis" and so loved exactly that band; this one rewards
+    # 0 and 45 and punishes the shallow zone. delta = angle to nearest axis.
     tang = np.diff(np.vstack([placed, placed[:1]]), axis=0)
     ang = np.arctan2(tang[:, 1], tang[:, 0])
-    align = 0.5 * (1.0 + np.cos(4.0 * (ang - grid.grid_angle)))
-    orientation = float(np.sum(w * align) / np.sum(w))
+    delta = (ang - grid.grid_angle) % (np.pi / 2)
+    delta = np.minimum(delta, np.pi / 2 - delta)              # fold to [0, 45 deg]
+    quality = np.where(delta < np.radians(2.5), 1.0, np.sin(2.0 * delta))
+    orientation = float(np.sum(w * quality) / np.sum(w))
     s_lo, s_hi = cfg["scale_range"]
     bigness = (scale - s_lo) / (s_hi - s_lo)               # prefer larger
     return (0.22 * coverage + 0.15 * closeness + 0.20 * feature
             + 0.13 * resolvable + 0.18 * orientation + 0.12 * bigness)
+
+
+def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
+    """True if two placements are visibly distinct (params may be 4- or 6-tuples)."""
+    s1, r1, x1, y1 = a[:4]
+    s2, r2, x2, y2 = b[:4]
+    a1, a2 = (a[4] if len(a) > 4 else 1.0), (b[4] if len(b) > 4 else 1.0)
+    return (abs((r1 - r2 + 180) % 360 - 180) > drot
+            or np.hypot(x1 - x2, y1 - y2) > doff
+            or abs(s1 - s2) > dscale
+            or abs(a1 - a2) > daspect)
 
 
 def build_route(grid, placed, cfg):
@@ -379,66 +409,73 @@ def build_route(grid, placed, cfg):
 
 
 def search_placement(contour, grid, cfg):
-    """Find the placement whose *routed* path best traces the shape.
+    """Rank placements by their *routed* fidelity; return the best DISTINCT ones.
 
     Two stages. (1) A fast geometric proxy (`_score`) ranks thousands of
-    placements on snap distance, feature coverage, resolvability and grid
-    alignment -- cheap, but blind to what the streets *between* anchors do, which
-    is how a placement can look fine yet route into big rectangular detours.
-    (2) The top `n_route_eval` candidates are actually routed and judged by
-    Frechet distance to the target, and the genuine best is returned. This is the
-    fix for "looks placeable but routes badly": the proxy nominates, routing votes.
+    placements on snap distance, feature coverage, resolvability and grid-angle
+    quality -- cheap, but blind to what the streets *between* anchors do.
+    (2) The proxy's best *visibly distinct* placements are actually routed and
+    judged by the composite match cost. We return a ranked list, not one winner,
+    because a placement-determined artifact (a shallow-angle edge that staircases
+    badly) can't be fixed downstream -- only a different placement escapes it, so
+    the caller presents several for the user to choose from.
     """
     rng = np.random.default_rng(cfg["seed"])
     base = resample(contour, n=250)          # cheap, transform-invariant proxy
     importance = waypoint_importance(base)   # which of those points define the shape
     s_lo, s_hi = cfg["scale_range"]
     lim = 0.5 - cfg["margin"]
+    ln_a = np.log(cfg["aspect_max"])
+    shm = cfg["shear_max"]
 
-    def trial(scale, rot, dx, dy):
-        cand = place(base, scale, rot, dx, dy)
-        return _score(cand, grid, scale, cfg, importance), (scale, rot, dx, dy)
+    def trial(scale, rot, dx, dy, aspect, shear):
+        cand = place(base, scale, rot, dx, dy, aspect, shear)
+        return (_score(cand, grid, scale, cfg, importance),
+                (scale, rot, dx, dy, aspect, shear))
 
     results = [trial(rng.uniform(s_lo, s_hi), rng.uniform(0, 360),
-                     rng.uniform(-lim, lim), rng.uniform(-lim, lim))
+                     rng.uniform(-lim, lim), rng.uniform(-lim, lim),
+                     float(np.exp(rng.uniform(-ln_a, ln_a))), rng.uniform(-shm, shm))
                for _ in range(cfg["n_random"])]
     results.sort(key=lambda r: r[0], reverse=True)
 
     for _ in range(cfg["n_refine"]):
-        _, (s, r, dx, dy) = results[rng.integers(0, min(8, len(results)))]
+        _, (s, r, dx, dy, asp, sh) = results[rng.integers(0, min(8, len(results)))]
         results.append(trial(
             float(np.clip(s + rng.normal(0, 0.04), s_lo, s_hi)),
             r + rng.normal(0, 6),
             dx + rng.normal(0, 0.03),
-            dy + rng.normal(0, 0.03)))
+            dy + rng.normal(0, 0.03),
+            float(np.clip(asp * np.exp(rng.normal(0, 0.05)), 1 / cfg["aspect_max"], cfg["aspect_max"])),
+            float(np.clip(sh + rng.normal(0, 0.03), -shm, shm))))
     results.sort(key=lambda r: r[0], reverse=True)
 
-    # Stage 2: route the proxy's best handful and let the composite cost (Frechet
-    # + average hug + feature fidelity) pick the real winner -- not Frechet alone,
-    # which sacrifices protrusions to shave the worst-case leash.
-    best = None  # (cost, placed, route)
-    seen = 0
-    for proxy_score, (scale, rot, dx, dy) in results:
-        placed = place(contour, scale, rot, dx, dy)
+    # Stage 2: route the proxy's best *distinct* placements (dedup first, so we
+    # don't waste the budget on near-identical refinements), score each by the
+    # perceptual placement cost (blurred render-compare), and return them ranked.
+    routed, tried, chosen_params = [], 0, []
+    for proxy_score, params in results:
+        if any(not _placement_far(params, q) for q in chosen_params):
+            continue                                   # skip near-duplicate placement
+        chosen_params.append(params)
+        placed = place(contour, *params)
         route, _, _ = build_route(grid, placed, cfg)
-        if len(route) < 3:
-            continue
-        cost = route_match_cost(route, placed)
-        print(f"  candidate proxy={proxy_score:.3f} -> match={cost:.4f} "
-              f"(scale={scale:.2f} rot={rot:.0f})")
-        if best is None or cost < best[0]:
-            best = (cost, placed, route)
-        seen += 1
-        if seen >= cfg["n_route_eval"]:
+        if len(route) >= 3:
+            cost = placement_cost(route, placed)
+            routed.append((cost, placed, route))
+            print(f"  placement proxy={proxy_score:.3f} -> cost={cost:.4f} "
+                  f"(scale={params[0]:.2f} rot={params[1]:.0f} "
+                  f"aspect={params[4]:.2f} shear={params[5]:+.2f})")
+        tried += 1
+        if tried >= cfg["n_route_eval"]:
             break
 
-    if best is None:  # nothing routed; fall back to the proxy's top placement
-        _, (scale, rot, dx, dy) = results[0]
-        placed = place(contour, scale, rot, dx, dy)
-        return placed, build_route(grid, placed, cfg)[0]
+    if not routed:  # nothing routed; fall back to the proxy's top placement
+        placed = place(contour, *results[0][1])
+        return [(float("inf"), placed, build_route(grid, placed, cfg)[0])]
 
-    print(f"placement chosen by routed match cost={best[0]:.4f}")
-    return best[1], best[2]
+    routed.sort(key=lambda e: e[0])
+    return routed
 
 
 # --------------------------------------------------------------------------- #
@@ -686,6 +723,45 @@ def close_loop(grid, route, dense, wp_idx, weight):
 
 
 # --------------------------------------------------------------------------- #
+# Distance + land checks                                                       #
+# --------------------------------------------------------------------------- #
+def route_length_m(route, grid):
+    """Real-world length of a route, in metres.
+
+    The route lives in [0, 1] coords that were obtained by dividing projected
+    metres by `grid.span`, so multiplying the summed segment lengths back by
+    `grid.span` recovers metres. (Returns the on-street distance actually run,
+    not straight-line.)
+    """
+    if len(route) < 2:
+        return 0.0
+    seg = np.linalg.norm(np.diff(np.asarray(route, np.float64), axis=0), axis=1)
+    return float(seg.sum() * grid.span)
+
+
+def format_distance(metres):
+    """'7.43 km / 4.62 mi'."""
+    return f"{metres / 1000:.2f} km / {metres / 1609.344:.2f} mi"
+
+
+def land_fraction(pts, grid, reach=2.5):
+    """Fraction of points that sit on walkable land.
+
+    A point is "on land" if a street node lies within `reach` average edges of
+    it. Water (rivers, ocean) and any area outside the fetched network have no
+    nearby nodes, so a shape spilling into them shows up as a low fraction. Parks
+    count as land because the park mesh added routable nodes there.
+    """
+    d, _ = grid.tree.query(np.asarray(pts, np.float64))
+    return float(np.mean(d < grid.avg_edge * reach))
+
+
+def on_land(placed, grid, cfg):
+    """True if the placed outline stays on walkable land (the no-ocean guard)."""
+    return land_fraction(placed, grid, cfg["land_reach"]) >= cfg["min_land_fraction"]
+
+
+# --------------------------------------------------------------------------- #
 # Fidelity metrics                                                            #
 # --------------------------------------------------------------------------- #
 def hausdorff(route, contour):
@@ -721,6 +797,35 @@ def frechet(route, contour, samples=140):
         for j in range(1, m):
             cur[j] = max(min(prev[j], prev[j - 1], cur[j - 1]), D[i, j])
     return float(ca[-1, -1])
+
+
+def perceptual_cost(route, placed, res=128, blur=4.0):
+    """Holistic, blur-tolerant shape distance via low-res render-and-compare.
+
+    Pointwise metrics (Frechet, mean deviation) are fooled by staircase noise --
+    a jagged edge is still "close on average" -- so a blocky blob can score well
+    yet not read as the shape. This rasterizes both closed outlines to small
+    filled masks, blurs them, and returns 1 - soft-IoU. Blur discards the
+    high-frequency staircase while preserving the gestalt, which is how the eye
+    judges it: it rewards capturing the overall form, not hugging every point.
+    """
+    def mask(poly):
+        m = np.zeros((res, res), np.float32)
+        p = np.clip(np.asarray(poly) * (res - 1), 0, res - 1).astype(np.int32)
+        cv2.fillPoly(m, [p], 1.0)
+        cv2.polylines(m, [p], True, 1.0, 1)        # so thin shapes still register
+        return cv2.GaussianBlur(m, (0, 0), blur)
+    a, b = mask(route), mask(placed)
+    union = float(np.sum(np.maximum(a, b)))
+    inter = float(np.sum(np.minimum(a, b)))
+    return 1.0 - (inter / union if union > 1e-9 else 0.0)
+
+
+def placement_cost(route, placed):
+    """Selection cost for the search: perceptual distance (primary) + a slice of
+    the geometric composite (keeps thin protrusions honest, since area-overlap
+    under-weights a skinny tail or beak)."""
+    return perceptual_cost(route, placed) + 0.3 * route_match_cost(route, placed)
 
 
 def route_match_cost(route, placed):
@@ -778,23 +883,24 @@ def plot(grid, contour, route):
     plt.show()
 
 
-def plot_options(grid, contour, labeled_routes):
-    """Plot several renderings (e.g. simple vs faithful) of one placement."""
+def plot_options(grid, panels):
+    """Plot panels of (label, placed_contour, route) side by side.
+
+    Each panel carries its own placed contour, so this works for both placement
+    diversity (different shapes per panel) and detail variants (same shape).
+    """
     segs = [[p1, p2] for p1, p2 in grid.edge_list]
-    fig, axes = plt.subplots(1, len(labeled_routes),
-                             figsize=(10 * len(labeled_routes), 10))
-    axes = np.atleast_1d(axes)
-    for ax, (name, route) in zip(axes, labeled_routes.items()):
+    fig, axes = plt.subplots(1, len(panels), figsize=(10 * len(panels), 10))
+    for ax, (label, placed, route) in zip(np.atleast_1d(axes), panels):
         ax.add_collection(LineCollection(segs, colors="steelblue",
                                          linewidths=0.5, alpha=0.3))
-        ax.plot(contour[:, 0], contour[:, 1], "--", color="purple", lw=2)
+        ax.plot(placed[:, 0], placed[:, 1], "--", color="purple", lw=2)
         if route:
             rx, ry = zip(*route)
             ax.plot(rx, ry, color="coral", lw=3, zorder=5)
-            ax.scatter(rx[0], ry[0], color="green", s=100, zorder=6)
-            ax.scatter(rx[-1], ry[-1], color="red", s=100, zorder=6)
+            ax.scatter(rx[0], ry[0], color="red", s=100, zorder=6)
         ax.set(xlim=(0, 1), ylim=(0, 1), aspect="equal")
-        ax.set_title(f"{name} ({len(route)} nodes)")
+        ax.set_title(label)
     plt.tight_layout()
     plt.show()
 
@@ -805,16 +911,15 @@ def plot_options(grid, contour, labeled_routes):
 def _report(label, grid, placed, route):
     if not route:
         print(f"{label}: no route"); return
-    length_m = sum(np.hypot(*(np.subtract(route[i], route[i - 1])))
-                   for i in range(1, len(route))) * grid.span
     print(f"{label}: {len(route)} nodes  IoU={iou(route, placed, 0.01):.3f}  "
-          f"Hausdorff={hausdorff(route, placed):.4f}  "
-          f"Frechet={frechet(route, placed):.4f}  length~{length_m / 1000:.2f} km")
+          f"Frechet={frechet(route, placed):.4f}  "
+          f"on-land={land_fraction(placed, grid) * 100:.0f}%  "
+          f"distance={format_distance(route_length_m(route, grid))}")
 # --------------------------------------------------------------------------- #
 # CONFIG                                                                       #
 # --------------------------------------------------------------------------- #
 CONFIG = dict(
-    svg_path="sample2.svg",
+    svg_path="boar.svg",
     # Street network location (default: midtown Manhattan).
     lat=40.7527,
     lng=-73.9943,
@@ -835,11 +940,20 @@ CONFIG = dict(
     img_size=2048,
 
     # Placement search.
-    scale_range=(1.2, 1.8),   # shape extent as a fraction of the grid span
+    scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
+    aspect_max=1.5,           # max area-preserving stretch (1.0 = uniform scale)
+    shear_max=0.20,           # max skew, for non-orthogonal grids
     n_random=2000,            # coarse random placements
     n_refine=600,             # refinements jittered around the best few
     n_route_eval=6,           # top candidates actually routed + judged by Frechet
     margin=0.02,              # keep the shape this far inside the [0, 1] box
+
+    # Keep the shape on walkable land. The route is always on streets, but the
+    # target placement could spill over a river/ocean (no nodes there) and distort
+    # the result. Reject any placement where less than `min_land_fraction` of the
+    # outline is within `land_reach` average edges of a street node.
+    min_land_fraction=0.85,
+    land_reach=2.5,
 
     # Routing / fidelity.
     deviation_weight=60.0,    # >> 1 makes "stay on the outline" dominate cost
@@ -859,8 +973,14 @@ CONFIG = dict(
     #   simple    -- low granularity + normal weight: a tidy, smoothed hug.
     #   faithful  -- high granularity + normal weight: traces every jog.
     present_options=True,
+    # "placements": show the top n_options DISTINCT placements (different rotations
+    #               / scales) so you can pick the one whose street angles read best
+    #               -- the fix for "every option has the same shallow-angle steps".
+    # "detail":     fix the single best placement, vary detail via option_presets.
+    option_mode="placements",
+    n_options=3,
     option_presets={
-        "efficient": dict(granularity=0.65, deviation_weight=10.0),
+        "efficient": dict(granularity=0.65, deviation_weight=1.0),
         "simple":    dict(granularity=0.35),
         "faithful":  dict(granularity=0.90),
     },
@@ -868,26 +988,34 @@ CONFIG = dict(
     # How far (in avg-edge lengths) the route may stray from the shape before an
     # out-and-back / loop is treated as an artifact instead of a real protrusion
     # (beak, leg, tail). Higher = more forgiving of genuine thin features.
-    protrusion_tolerance=2.0,
+    protrusion_tolerance=2.5,
 
     seed=42,
 )
 
+
 def main(cfg=CONFIG):
     grid = build_grid(cfg)
     contour = extract_contour(cfg["svg_path"], cfg["img_size"])
-    placed, route = search_placement(contour, grid, cfg)
+    ranked = search_placement(contour, grid, cfg)   # [(cost, placed, route), ...]
+    best_cost, best_placed, best_route = ranked[0]
 
-    if cfg.get("present_options"):
-        # Same placement, two detail levels. Render is cheap; search already ran.
-        options = {}
-        for name, override in cfg["option_presets"].items():
-            options[name] = build_route(grid, placed, {**cfg, **override})[0]
-            _report(name, grid, placed, options[name])
-        plot_options(grid, placed, options)
-    else:
-        _report("route", grid, placed, route)
-        plot(grid, placed, route)
+    if not cfg.get("present_options"):
+        _report("route", grid, best_placed, best_route)
+        plot(grid, best_placed, best_route)
+        return
+
+    if cfg["option_mode"] == "placements":
+        # Different placements per panel -- pick the one whose street angles read best.
+        panels = [(f"placement {i + 1}  cost={c:.3f}", pl, rt)
+                  for i, (c, pl, rt) in enumerate(ranked[:cfg["n_options"]])]
+    else:  # "detail": fix the best placement, vary detail
+        panels = [(name, best_placed, build_route(grid, best_placed, {**cfg, **ov})[0])
+                  for name, ov in cfg["option_presets"].items()]
+
+    for label, pl, rt in panels:
+        _report(label, grid, pl, rt)
+    plot_options(grid, panels)
 
 
 if __name__ == "__main__":
