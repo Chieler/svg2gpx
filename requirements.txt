@@ -1,0 +1,7 @@
+# Core dependencies for the pipeline, benchmark, and best-route selection.
+# Sufficient for synthetic-grid runs (no network).
+numpy
+scipy
+shapely
+opencv-python-headless
+skia-python

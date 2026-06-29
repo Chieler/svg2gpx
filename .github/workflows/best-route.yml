@@ -1,0 +1,68 @@
+name: Best Route
+
+# Manually compute the best of gen.py's top-3 candidate routes for a shape (or
+# all shapes), then commit the resulting metrics to result.csv.
+on:
+  workflow_dispatch:
+    inputs:
+      shape:
+        description: "Shape to route (file stem in shapes/, e.g. 'star', or 'all')"
+        type: string
+        default: "all"
+      grid:
+        description: "Street grid source"
+        type: choice
+        options:
+          - synthetic
+          - real
+        default: synthetic
+      grid_size:
+        description: "Synthetic lattice resolution (nodes per side)"
+        type: string
+        default: "50"
+
+permissions:
+  contents: write
+
+jobs:
+  best-route:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system libraries (skia)
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          if [ "${{ inputs.grid }}" = "real" ]; then
+            pip install -r requirements-osm.txt
+          fi
+
+      - name: Compute best route(s)
+        run: |
+          python best_route.py \
+            --shape "${{ inputs.shape }}" \
+            --grid "${{ inputs.grid }}" \
+            --grid-size "${{ inputs.grid_size }}" \
+            --out result.csv
+
+      - name: Commit result.csv
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add result.csv
+          if git diff --cached --quiet; then
+            echo "result.csv unchanged; nothing to commit"
+          else
+            git commit -m "chore: update best-route result.csv (shape=${{ inputs.shape }}, grid=${{ inputs.grid }})"
+            git push
+          fi

@@ -1,0 +1,5 @@
+# Extra dependencies for the real-OSM path (gen.build_grid) and plotting.
+# Only needed when running against live OpenStreetMap data (--grid real) or
+# using gen.py's matplotlib plots. Install on top of requirements.txt.
+osmnx
+matplotlib
