@@ -31,11 +31,13 @@ from dataclasses import dataclass
 import numpy as np
 import cv2
 import skia
-import osmnx as ox
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
+
+# osmnx (live OSM fetch) and matplotlib (plotting) are imported lazily inside the
+# functions that need them -- build_grid and plot* -- so that callers which only
+# reuse the geometry/routing/metric helpers (e.g. benchmark.py on a synthetic
+# grid) don't pay for those heavy, network-oriented deps just to import this.
 
 
 
@@ -60,6 +62,7 @@ class Grid:
 
 def build_grid(cfg):
     """Fetch the walkable network (and parks), normalize to [0, 1], index it."""
+    import osmnx as ox
     G = ox.graph_from_point((cfg["lat"], cfg["lng"]), dist=cfg["radius_m"],
                             network_type="walk", simplify=True)
     G_proj = ox.project_graph(G)
@@ -866,6 +869,8 @@ def iou(route, contour, buffer):
 # Plot                                                                         #
 # --------------------------------------------------------------------------- #
 def plot(grid, contour, route):
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.add_collection(LineCollection(
         [[p1, p2] for p1, p2 in grid.edge_list],
@@ -889,6 +894,8 @@ def plot_options(grid, panels):
     Each panel carries its own placed contour, so this works for both placement
     diversity (different shapes per panel) and detail variants (same shape).
     """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
     segs = [[p1, p2] for p1, p2 in grid.edge_list]
     fig, axes = plt.subplots(1, len(panels), figsize=(10 * len(panels), 10))
     for ax, (label, placed, route) in zip(np.atleast_1d(axes), panels):

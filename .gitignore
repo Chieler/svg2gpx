@@ -1,0 +1,8 @@
+# Benchmark cache + outputs
+.cache/
+benchmark_results.csv
+benchmark_results.json
+
+# Python
+__pycache__/
+*.pyc
