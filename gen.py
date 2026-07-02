@@ -440,10 +440,16 @@ def extract_shape(svg_path, img_size, min_perimeter=0.05, dup_tol=None):
 
     # Drop near-duplicates: longest first, keep a feature only if some part of
     # it is farther than tol from everything kept so far (incl. the outline).
+    # The tolerance is capped by the candidate's own extent: a duplicate edge
+    # (the second side of a stroke) parallels something its own size, whereas a
+    # small hole that merely sits NEAR the outline (a shark's eye at high
+    # raster resolution) must not be swallowed by the stroke-width tolerance.
     candidates.sort(key=lambda t: -_arc_len(t[0]))
     kept, refs = [], [pts_of[main]]
     for pts, closed in candidates:
-        if any(cKDTree(r).query(pts)[0].max() < tol_px for r in refs):
+        extent = float(max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1])))
+        eff_tol = min(tol_px, 0.5 * extent)
+        if any(cKDTree(r).query(pts)[0].max() < eff_tol for r in refs):
             continue
         kept.append((pts, closed))
         refs.append(pts)
