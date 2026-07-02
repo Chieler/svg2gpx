@@ -154,9 +154,18 @@ tree, whether or not they touch the outer contour:
 `extract_contour()` still returns just the outer outline, so existing callers are
 unchanged. Visual check: `python preview_features.py` (writes
 `inner_features_preview.png`); correctness checks: `python test_inner_features.py`.
-Placement + routing of the inner features is the next step: the chosen placement
-transform applies to them verbatim, closed features route as separate loops and
-open ones as out-and-back spurs.
+
+The features are then **placed and routed** with the outer contour: every feature
+is transformed with the exact placement chosen for the outline (same pivot), closed
+features route as their own loops and open ones as out-and-back spurs
+(`build_feature_route`). And because features are only useful when the contour is
+good, the placement search's second stage — the top `n_route_eval` routed
+candidates — folds each candidate's **feature fidelity into its cost**
+(`feature_cost`): the per-feature routed deviation (1.0 for a feature that is
+off-grid or below street resolution), size-weighted and bounded by the features'
+share of total drawn length, scaled by `inner_cost_weight`. A placement whose
+contour seats nicely but strands the eye now ranks below one that draws both.
+Disable with `inner_features=False`.
 
 ## Repository layout
 

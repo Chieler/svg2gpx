@@ -488,9 +488,13 @@ def _close(pts):
     return pts
 
 
-def resample(pts, n=None, step=None):
-    """Evenly respace a (closed) polyline by point count or arc-length step."""
-    pts = _close(pts)
+def resample(pts, n=None, step=None, closed=True):
+    """Evenly respace a polyline by point count or arc-length step.
+
+    closed=True (default) treats `pts` as a loop, appending the start point if
+    needed; closed=False resamples an open path between its endpoints.
+    """
+    pts = _close(pts) if closed else np.asarray(pts, dtype=np.float64)
     seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
     arc = np.concatenate([[0.0], np.cumsum(seg)])
     total = arc[-1]
@@ -504,7 +508,7 @@ def resample(pts, n=None, step=None):
     return np.column_stack([x, y])
 
 
-def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0):
+def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0, center=None):
     """Affine-place a polyline about its centroid, then translate.
 
     Beyond similarity (scale + rot + translate) this adds two shape-fitting DOF:
@@ -513,9 +517,13 @@ def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0):
                   better and turns shallow-angle edges into aligned ones.
       * shear  -- a small skew, for grids that aren't perfectly orthogonal.
     aspect=1, shear=0 reduces exactly to the old similarity transform.
+
+    `center` overrides the pivot: an inner feature must be placed about the
+    OUTER contour's centroid (the same pivot its outline was placed about) so
+    it lands where the drawing put it, not spun about its own middle.
     """
     pts = np.asarray(pts, dtype=np.float64)
-    c = pts.mean(axis=0)
+    c = np.asarray(center, dtype=np.float64) if center is not None else pts.mean(axis=0)
     a = np.radians(rot_deg)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     H = np.array([[1.0, shear], [0.0, 1.0]])
@@ -621,17 +629,90 @@ def build_route(grid, placed, cfg):
     return route, dense, waypoints
 
 
-def search_placement(contour, grid, cfg):
+@dataclass
+class Candidate:
+    """One evaluated placement: the outer route plus its routed inner features."""
+    cost: float          # combined cost: outer fidelity + weighted feature term
+    placed: np.ndarray   # placed outer contour
+    route: list          # routed outer loop
+    feats: list          # [(Feature, placed_pts, route), ...]; route may be []
+
+
+def build_feature_route(grid, placed_feat, closed, cfg):
+    """Route one placed inner feature: a loop if closed, an open path if not.
+
+    An open path is a drawn interior line (a wing line); the runner traces it
+    and returns the same way (out-and-back), so the routed polyline is the
+    single pass. Returns [] when the feature is too small to resolve on this
+    grid (e.g. an eye smaller than a block).
+    """
+    dense, waypoints, wp_idx = snap_waypoints(placed_feat, grid, cfg, closed=closed)
+    if len(waypoints) < (3 if closed else 2):
+        return []
+    w = cfg["deviation_weight"]
+    route = route_contour(grid, dense, waypoints, wp_idx, w)
+    return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed)
+
+
+def route_features(grid, inners, params, center, cfg):
+    """Place every inner feature with the outer contour's transform and route it.
+
+    `center` is the outer contour's centroid: features share the outline's
+    pivot so they land where the drawing put them.
+    """
+    feats = []
+    for f in inners:
+        fp = place(f.pts, *params, center=center)
+        feats.append((f, fp, build_feature_route(grid, fp, f.closed, cfg)))
+    return feats
+
+
+def feature_cost(grid, placed_outer, feats):
+    """Score how well the inner features landed, for placement ranking.
+
+    Returns (miss, weight). `miss` is the size-weighted mean per-feature cost
+    in [0, 1]: 0 when every feature's route hugs its target, 1 for a feature
+    that is unroutable here (off-grid, or collapsed below street resolution) --
+    so placements that seat the body nicely but strand the eye rank below ones
+    that draw both. `weight` is how much the features matter relative to the
+    outline (total feature arc / outline arc, capped at 1): an eye dot can tip
+    a close call but never outvote the body.
+    """
+    if not feats:
+        return 0.0, 0.0
+    sizes, costs = [], []
+    for f, fp, fr in feats:
+        sizes.append(_arc_len(fp))
+        if len(fr) < 2:
+            costs.append(1.0)
+            continue
+        r = np.asarray(fr, np.float64)
+        t = np.asarray(fp, np.float64)
+        dev = 0.5 * (float(cKDTree(r).query(t)[0].mean())
+                     + float(cKDTree(t).query(r)[0].mean()))
+        costs.append(min(dev / (3.0 * grid.avg_edge), 1.0))
+    total = float(sum(sizes))
+    if total <= 0.0:
+        return 0.0, 0.0
+    weight = min(total / max(_arc_len(placed_outer), 1e-9), 1.0)
+    return float(np.average(costs, weights=sizes)), weight
+
+
+def search_placement(contour, grid, cfg, inners=None):
     """Rank placements by their *routed* fidelity; return the best DISTINCT ones.
 
     Two stages. (1) A fast geometric proxy (`_score`) ranks thousands of
     placements on snap distance, feature coverage, resolvability and grid-angle
     quality -- cheap, but blind to what the streets *between* anchors do.
     (2) The proxy's best *visibly distinct* placements are actually routed and
-    judged by the composite match cost. We return a ranked list, not one winner,
-    because a placement-determined artifact (a shallow-angle edge that staircases
-    badly) can't be fixed downstream -- only a different placement escapes it, so
-    the caller presents several for the user to choose from.
+    judged by the composite match cost. When `inners` (the shape's inner
+    features from extract_shape) are given, each of those top placements also
+    places and routes the features with the same transform, and their routed
+    fidelity joins the cost -- a good contour that strands its inner features
+    loses to one that draws both. We return a ranked list of Candidates, not
+    one winner, because a placement-determined artifact (a shallow-angle edge
+    that staircases badly) can't be fixed downstream -- only a different
+    placement escapes it, so the caller presents several to choose from.
     """
     rng = np.random.default_rng(cfg["seed"])
     base = resample(contour, n=250)          # cheap, transform-invariant proxy
@@ -665,7 +746,11 @@ def search_placement(contour, grid, cfg):
 
     # Stage 2: route the proxy's best *distinct* placements (dedup first, so we
     # don't waste the budget on near-identical refinements), score each by the
-    # perceptual placement cost (blurred render-compare), and return them ranked.
+    # perceptual placement cost (blurred render-compare) plus, when the shape
+    # has inner features, their routed fidelity -- and return them ranked.
+    inners = inners or []
+    center = np.asarray(contour, np.float64).mean(axis=0)
+    w_inner = cfg.get("inner_cost_weight", 0.6)
     routed, tried, chosen_params = [], 0, []
     for proxy_score, params in results:
         if any(not _placement_far(params, q) for q in chosen_params):
@@ -675,26 +760,36 @@ def search_placement(contour, grid, cfg):
         route, _, _ = build_route(grid, placed, cfg)
         if len(route) >= 3:
             cost = placement_cost(route, placed)
-            routed.append((cost, placed, route))
+            feats = route_features(grid, inners, params, center, cfg)
+            note = ""
+            if feats:
+                miss, weight = feature_cost(grid, placed, feats)
+                cost += w_inner * weight * miss
+                note = (f" feat_miss={miss:.2f}x{weight:.2f} "
+                        f"({sum(1 for _, _, fr in feats if len(fr) >= 2)}"
+                        f"/{len(feats)} routed)")
+            routed.append(Candidate(cost, placed, route, feats))
             print(f"  placement proxy={proxy_score:.3f} -> cost={cost:.4f} "
                   f"(scale={params[0]:.2f} rot={params[1]:.0f} "
-                  f"aspect={params[4]:.2f} shear={params[5]:+.2f})")
+                  f"aspect={params[4]:.2f} shear={params[5]:+.2f}){note}")
         tried += 1
         if tried >= cfg["n_route_eval"]:
             break
 
     if not routed:  # nothing routed; fall back to the proxy's top placement
-        placed = place(contour, *results[0][1])
-        return [(float("inf"), placed, build_route(grid, placed, cfg)[0])]
+        params = results[0][1]
+        placed = place(contour, *params)
+        return [Candidate(float("inf"), placed, build_route(grid, placed, cfg)[0],
+                          route_features(grid, inners, params, center, cfg))]
 
-    routed.sort(key=lambda e: e[0])
+    routed.sort(key=lambda c: c.cost)
     return routed
 
 
 # --------------------------------------------------------------------------- #
 # Snapping + routing                                                          #
 # --------------------------------------------------------------------------- #
-def snap_waypoints(placed, grid, cfg):
+def snap_waypoints(placed, grid, cfg, closed=True):
     """Pick routing anchors off the outline and snap them to street nodes.
 
     The outline is densified once at a fine, fixed resolution (`dense`) -- this is
@@ -715,8 +810,10 @@ def snap_waypoints(placed, grid, cfg):
     within `dense` (so the router can slice the local arc between anchors).
     """
     g = cfg["granularity"]
-    dense = resample(placed, step=grid.avg_edge * 0.4)     # fine, fixed reference
+    dense = resample(placed, step=grid.avg_edge * 0.4, closed=closed)
     importance = waypoint_importance(dense)
+    # (On an open path the cyclic importance chord wraps end-to-start, which
+    # marks both endpoints as important -- exactly right: they must be anchors.)
 
     max_gap = grid.avg_edge * (5.0 - 4.6 * g)              # g=0 -> very sparse; g=1 -> ~0.4 edge
     feat_thresh = 0.35 * (1.0 - g)                         # g=1 -> keep all; g=0 -> only features
@@ -901,11 +998,12 @@ def shortcut_nooks(grid, route, contour_tree, weight, window, slack):
     return out
 
 
-def cleanup(grid, route, dense, wp_idx, weight, cfg):
+def cleanup(grid, route, dense, wp_idx, weight, cfg, close=True):
     """Close the loop, then strip artifacts while protecting real protrusions.
 
     The densified placed outline (``dense``) is the reference shape: cleanup only
-    removes route features that disagree with it.
+    removes route features that disagree with it. close=False skips the loop
+    closure (for open feature paths, which are run out-and-back instead).
     """
     contour_tree = cKDTree(np.asarray(dense, dtype=np.float64))
     tol = grid.avg_edge * cfg["protrusion_tolerance"]
@@ -914,7 +1012,8 @@ def cleanup(grid, route, dense, wp_idx, weight, cfg):
     slack = grid.avg_edge * (1.0 - g) ** 0.6 * 3.5  # corner-cut budget when smoothing
 
     route = remove_backtracks(route, contour_tree, tol)
-    route = close_loop(grid, route, dense, wp_idx, weight)
+    if close:
+        route = close_loop(grid, route, dense, wp_idx, weight)
     if len(route) < 4:
         return route
     closed = route[0] == route[-1]
@@ -1172,7 +1271,17 @@ def _finish(plt, fig, save, show):
         plt.close(fig)
 
 
-def plot(grid, contour, route, save=None, show=True):
+def _draw_features(ax, feats):
+    """Overlay placed inner-feature targets (dashed) and their routes."""
+    for i, (f, fp, fr) in enumerate(feats):
+        ax.plot(fp[:, 0], fp[:, 1], "--", color="purple", lw=1.2, alpha=0.6)
+        if len(fr) >= 2:
+            fx, fy = zip(*fr)
+            ax.plot(fx, fy, color="darkorange", lw=2.5, zorder=5,
+                    label="inner features" if i == 0 else None)
+
+
+def plot(grid, contour, route, feats=(), save=None, show=True):
     plt = _matplotlib(show)
     from matplotlib.collections import LineCollection
     fig, ax = plt.subplots(figsize=(10, 10))
@@ -1186,29 +1295,31 @@ def plot(grid, contour, route, save=None, show=True):
         ax.plot(rx, ry, color="coral", lw=3, zorder=5, label="route")
         ax.scatter(rx[0], ry[0], color="green", s=100, zorder=6)
         ax.scatter(rx[-1], ry[-1], color="red", s=100, zorder=6)
+    _draw_features(ax, feats)
     ax.set(xlim=(0, 1), ylim=(0, 1), aspect="equal")
     ax.legend()
     _finish(plt, fig, save, show)
 
 
 def plot_options(grid, panels, save=None, show=True):
-    """Plot panels of (label, placed_contour, route) side by side.
+    """Plot panels of (label, Candidate) side by side.
 
     Each panel carries its own placed contour, so this works for both placement
-    diversity (different shapes per panel) and detail variants (same shape).
+    diversity (different placements per panel) and detail variants (same shape).
     """
     plt = _matplotlib(show)
     from matplotlib.collections import LineCollection
     segs = [[p1, p2] for p1, p2 in grid.edge_list]
     fig, axes = plt.subplots(1, len(panels), figsize=(10 * len(panels), 10))
-    for ax, (label, placed, route) in zip(np.atleast_1d(axes), panels):
+    for ax, (label, cand) in zip(np.atleast_1d(axes), panels):
         ax.add_collection(LineCollection(segs, colors="steelblue",
                                          linewidths=0.5, alpha=0.3))
-        ax.plot(placed[:, 0], placed[:, 1], "--", color="purple", lw=2)
-        if route:
-            rx, ry = zip(*route)
+        ax.plot(cand.placed[:, 0], cand.placed[:, 1], "--", color="purple", lw=2)
+        if cand.route:
+            rx, ry = zip(*cand.route)
             ax.plot(rx, ry, color="coral", lw=3, zorder=5)
             ax.scatter(rx[0], ry[0], color="red", s=100, zorder=6)
+        _draw_features(ax, cand.feats)
         ax.set(xlim=(0, 1), ylim=(0, 1), aspect="equal")
         ax.set_title(label)
     _finish(plt, fig, save, show)
@@ -1217,13 +1328,29 @@ def plot_options(grid, panels, save=None, show=True):
 # --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
-def _report(label, grid, placed, route):
+def feature_run_length_m(feats, grid):
+    """Total running distance of the routed inner features, in metres.
+
+    A closed feature is run once around; an open one is run out-and-back, so
+    its single-pass length counts twice.
+    """
+    return sum(route_length_m(fr, grid) * (1.0 if f.closed else 2.0)
+               for f, _, fr in feats if len(fr) >= 2)
+
+
+def _report(label, grid, cand):
+    placed, route = cand.placed, cand.route
     if not route:
         print(f"{label}: no route"); return
-    print(f"{label}: {len(route)} nodes  IoU={iou(route, placed, 0.01):.3f}  "
-          f"Frechet={frechet(route, placed):.4f}  "
-          f"on-land={land_fraction(placed, grid) * 100:.0f}%  "
-          f"distance={format_distance(route_length_m(route, grid))}")
+    msg = (f"{label}: {len(route)} nodes  IoU={iou(route, placed, 0.01):.3f}  "
+           f"Frechet={frechet(route, placed):.4f}  "
+           f"on-land={land_fraction(placed, grid) * 100:.0f}%  "
+           f"distance={format_distance(route_length_m(route, grid))}")
+    if cand.feats:
+        n = sum(1 for _, _, fr in cand.feats if len(fr) >= 2)
+        msg += (f"  inner-features={n}/{len(cand.feats)} routed "
+                f"(+{format_distance(feature_run_length_m(cand.feats, grid))})")
+    print(msg)
 # --------------------------------------------------------------------------- #
 # CONFIG                                                                       #
 # --------------------------------------------------------------------------- #
@@ -1256,6 +1383,13 @@ CONFIG = dict(
     # extracted alongside the outline by extract_shape; features whose length
     # is below this fraction of the [0, 1] frame are treated as raster noise.
     inner_min_perimeter=0.05,
+    # Place + route the inner features with the chosen outer transform, and let
+    # their routed fidelity join the placement cost of the top n_route_eval
+    # candidates: a placement whose contour seats nicely but strands the eye
+    # ranks below one that draws both. Weight scales the feature term (which is
+    # itself bounded by the features' share of total drawn length).
+    inner_features=True,
+    inner_cost_weight=0.6,
 
     # Placement search.
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
@@ -1321,25 +1455,32 @@ def main(cfg=CONFIG):
         n_open = sum(1 for f in spec.inners if not f.closed)
         print(f"inner features: {len(spec.inners)} "
               f"({len(spec.inners) - n_open} closed loop(s), {n_open} open path(s))")
-    ranked = search_placement(contour, grid, cfg)   # [(cost, placed, route), ...]
-    best_cost, best_placed, best_route = ranked[0]
+    inners = spec.inners if cfg.get("inner_features", True) else []
+    ranked = search_placement(contour, grid, cfg, inners=inners)   # [Candidate, ...]
+    best = ranked[0]
     save, show = cfg.get("save_plot"), cfg.get("show_plot", True)
 
     if not cfg.get("present_options"):
-        _report("route", grid, best_placed, best_route)
-        plot(grid, best_placed, best_route, save=save, show=show)
+        _report("route", grid, best)
+        plot(grid, best.placed, best.route, feats=best.feats, save=save, show=show)
         return ranked
 
     if cfg["option_mode"] == "placements":
         # Different placements per panel -- pick the one whose street angles read best.
-        panels = [(f"placement {i + 1}  cost={c:.3f}", pl, rt)
-                  for i, (c, pl, rt) in enumerate(ranked[:cfg["n_options"]])]
+        panels = [(f"placement {i + 1}  cost={c.cost:.3f}", c)
+                  for i, c in enumerate(ranked[:cfg["n_options"]])]
     else:  # "detail": fix the best placement, vary detail
-        panels = [(name, best_placed, build_route(grid, best_placed, {**cfg, **ov})[0])
-                  for name, ov in cfg["option_presets"].items()]
+        panels = []
+        for name, ov in cfg["option_presets"].items():
+            c2 = {**cfg, **ov}
+            feats = [(f, fp, build_feature_route(grid, fp, f.closed, c2))
+                     for f, fp, _ in best.feats]
+            panels.append((name, Candidate(best.cost, best.placed,
+                                           build_route(grid, best.placed, c2)[0],
+                                           feats)))
 
-    for label, pl, rt in panels:
-        _report(label, grid, pl, rt)
+    for label, cand in panels:
+        _report(label, grid, cand)
     plot_options(grid, panels, save=save, show=show)
     return ranked
 

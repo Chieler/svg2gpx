@@ -151,7 +151,8 @@ def run_case(grid, case, cfg):
     ranked = search_placement(contour, grid, {**cfg, "svg_path": case["svg"]})
     t_search = time.perf_counter() - t1
 
-    cost, placed, route = ranked[0]
+    best = ranked[0]
+    cost, placed, route = best.cost, best.placed, best.route
     if len(route) < 2:
         return {"name": case["name"], "nodes": len(route), "cost": cost,
                 "frechet": float("nan"), "hausdorff": float("nan"), "iou": 0.0,

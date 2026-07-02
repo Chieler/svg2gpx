@@ -56,15 +56,15 @@ def best_for_shape(grid, svg, cfg):
     """
     contour = extract_contour(svg, cfg["img_size"])
     eval_cfg = {**cfg, "svg_path": svg, "n_route_eval": N_BEST, "n_options": N_BEST}
-    ranked = search_placement(contour, grid, eval_cfg)   # sorted best-first
+    ranked = search_placement(contour, grid, eval_cfg)   # Candidates, best-first
     candidates = ranked[:N_BEST]
-    costs = [float(c) for c, _, _ in candidates]
+    costs = [float(c.cost) for c in candidates]
     return costs, candidates[0]
 
 
 def score_row(name, grid_kind, costs, best, grid):
     """Build the result.csv row for the chosen best route."""
-    cost, placed, route = best
+    cost, placed, route = best.cost, best.placed, best.route
     if len(route) < 2:
         return {"shape": name, "grid": grid_kind,
                 "candidates": " ".join(f"{c:.4f}" for c in costs),
