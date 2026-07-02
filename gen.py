@@ -61,11 +61,30 @@ class Grid:
 
 
 def build_grid(cfg):
-    """Fetch the walkable network (and parks), normalize to [0, 1], index it."""
+    """Fetch (or load) the walkable network, normalize to [0, 1], index it.
+
+    Two sources, same result:
+      * live fetch (default)     -- ox.graph_from_point around lat/lng, or
+      * local GraphML (offline)  -- cfg["graphml_path"]: a previously saved
+        ox.save_graphml network (e.g. a whole-city snapshot), cropped to the
+        same lat/lng + radius_m window. This makes real-map runs reproducible
+        and usable where the Overpass API is slow, rate-limited or unreachable.
+    """
     import osmnx as ox
-    G = ox.graph_from_point((cfg["lat"], cfg["lng"]), dist=cfg["radius_m"],
-                            network_type="walk", simplify=True)
-    G_proj = ox.project_graph(G)
+    if cfg.get("graphml_path"):
+        G = ox.load_graphml(cfg["graphml_path"])
+        bbox = ox.utils_geo.bbox_from_point((cfg["lat"], cfg["lng"]),
+                                            dist=cfg["radius_m"])
+        G = ox.truncate.truncate_graph_bbox(G, bbox)
+    else:
+        G = ox.graph_from_point((cfg["lat"], cfg["lng"]), dist=cfg["radius_m"],
+                                network_type="walk", simplify=True)
+    return grid_from_graph(ox.project_graph(G), cfg)
+
+
+def grid_from_graph(G_proj, cfg):
+    """Turn a projected osmnx graph into the router's normalized Grid."""
+    import osmnx as ox
     nodes, _ = ox.graph_to_gdfs(G_proj)
 
     xs, ys = nodes.geometry.x.values, nodes.geometry.y.values
@@ -84,9 +103,18 @@ def build_grid(cfg):
         graph.setdefault(b, []).append((a, d))
         edge_list.append((a, b))
 
+    # osmnx returns a MultiDiGraph: a two-way street appears as both u->v and
+    # v->u (and occasionally as parallel edges). link() already wires both
+    # directions, so process each node pair once -- this halves adjacency size
+    # (faster Dijkstra neighbor scans) and stops avg_edge double-counting.
+    seen_pairs = set()
     for u, v, data in G_proj.edges(data=True):
-        if u not in coord or v not in coord:
+        if u not in coord or v not in coord or u == v:
             continue
+        pair = frozenset((u, v))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
         p1, p2 = coord[u], coord[v]
         if step is None:
             link(p1, p2)
@@ -259,6 +287,9 @@ def extract_contour(svg_path, img_size):
     solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
 
     contours, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError(f"no drawable outline found in {svg_path!r} "
+                         "(empty or unsupported SVG)")
     outer = max(contours, key=cv2.contourArea)
     pts = np.array([[p[0][0] / img_size, 1.0 - p[0][1] / img_size] for p in outer])
     return _close(pts)
@@ -324,17 +355,15 @@ def waypoint_importance(pts, k=4):
     """
     pts = np.asarray(pts, dtype=np.float64)
     n = len(pts)
-    imp = np.zeros(n)
     if n < 2 * k + 1:
-        return imp
-    for i in range(n):
-        a, p, b = pts[(i - k) % n], pts[i], pts[(i + k) % n]
-        chord = b - a
-        L = np.hypot(*chord)
-        if L < 1e-12:
-            continue
-        # perpendicular distance from p to the line through a,b (2*area / base)
-        imp[i] = abs(chord[0] * (a[1] - p[1]) - chord[1] * (a[0] - p[0])) / L
+        return np.zeros(n)
+    a = np.roll(pts, k, axis=0)                    # neighbour k steps behind
+    b = np.roll(pts, -k, axis=0)                   # neighbour k steps ahead
+    chord = b - a
+    L = np.hypot(chord[:, 0], chord[:, 1])
+    # perpendicular distance from p to the line through a,b (2*area / base)
+    cross = chord[:, 0] * (a[:, 1] - pts[:, 1]) - chord[:, 1] * (a[:, 0] - pts[:, 0])
+    imp = np.where(L > 1e-12, np.abs(cross) / np.where(L > 1e-12, L, 1.0), 0.0)
     peak = imp.max()
     return imp / peak if peak > 0 else imp
 
@@ -561,6 +590,7 @@ def route_pair(graph, src, dst, seg, weight):
     if src == dst:
         return [src]
     dist_to = _polyline_dist_fn(seg)
+    dev = {}                 # node -> distance to outline, computed once per node
     heap = [(0.0, 0, src)]
     best = {src: 0.0}
     prev = {src: None}
@@ -576,7 +606,10 @@ def route_pair(graph, src, dst, seg, weight):
         for v, w in graph.get(u, ()):
             if v in seen:
                 continue
-            nc = cost + w + weight * dist_to(v)
+            dv = dev.get(v)
+            if dv is None:
+                dv = dev[v] = dist_to(v)
+            nc = cost + w + weight * dv
             if nc < best.get(v, np.inf):
                 best[v] = nc
                 prev[v] = u
@@ -862,12 +895,12 @@ def turning_distance(route, contour, samples=180):
     a = signature(route)
     b0 = signature(contour)
     n = len(a)
+    idx = (np.arange(n)[None, :] - np.arange(n)[:, None]) % n   # row k == roll(b, k)
     best = np.inf
     for bd in (b0, b0[::-1]):                    # both winding directions
-        for k in range(n):
-            diff = a - np.roll(bd, k)
-            diff = diff - diff.mean()            # remove constant rotation offset
-            best = min(best, float(np.sqrt(np.mean(diff ** 2))))
+        diff = a[None, :] - bd[idx]              # all cyclic shifts at once
+        diff -= diff.mean(axis=1, keepdims=True)  # remove constant rotation offset
+        best = min(best, float(np.sqrt((diff ** 2).mean(axis=1).min())))
     return best
 
 
@@ -937,8 +970,29 @@ def iou(route, contour, buffer):
 # --------------------------------------------------------------------------- #
 # Plot                                                                         #
 # --------------------------------------------------------------------------- #
-def plot(grid, contour, route):
+def _matplotlib(show):
+    """Import matplotlib, falling back to the headless Agg backend when the
+    figure is only being saved (no display needed / available)."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    return plt
+
+
+def _finish(plt, fig, save, show):
+    plt.tight_layout()
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+        print(f"saved plot -> {save}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot(grid, contour, route, save=None, show=True):
+    plt = _matplotlib(show)
     from matplotlib.collections import LineCollection
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.add_collection(LineCollection(
@@ -953,17 +1007,16 @@ def plot(grid, contour, route):
         ax.scatter(rx[-1], ry[-1], color="red", s=100, zorder=6)
     ax.set(xlim=(0, 1), ylim=(0, 1), aspect="equal")
     ax.legend()
-    plt.tight_layout()
-    plt.show()
+    _finish(plt, fig, save, show)
 
 
-def plot_options(grid, panels):
+def plot_options(grid, panels, save=None, show=True):
     """Plot panels of (label, placed_contour, route) side by side.
 
     Each panel carries its own placed contour, so this works for both placement
     diversity (different shapes per panel) and detail variants (same shape).
     """
-    import matplotlib.pyplot as plt
+    plt = _matplotlib(show)
     from matplotlib.collections import LineCollection
     segs = [[p1, p2] for p1, p2 in grid.edge_list]
     fig, axes = plt.subplots(1, len(panels), figsize=(10 * len(panels), 10))
@@ -977,8 +1030,7 @@ def plot_options(grid, panels):
             ax.scatter(rx[0], ry[0], color="red", s=100, zorder=6)
         ax.set(xlim=(0, 1), ylim=(0, 1), aspect="equal")
         ax.set_title(label)
-    plt.tight_layout()
-    plt.show()
+    _finish(plt, fig, save, show)
 
 
 # --------------------------------------------------------------------------- #
@@ -995,11 +1047,15 @@ def _report(label, grid, placed, route):
 # CONFIG                                                                       #
 # --------------------------------------------------------------------------- #
 CONFIG = dict(
-    svg_path="boar.svg",
+    svg_path="shapes/star.svg",   # any of the bundled shapes/*.svg, or your own
     # Street network location (default: midtown Manhattan).
     lat=40.7527,
     lng=-73.9943,
     radius_m=1600,
+    # Optional: path to a saved ox.save_graphml network to load instead of
+    # fetching from the Overpass API (offline / reproducible real-map runs).
+    # The graph is cropped to the lat/lng + radius_m window above.
+    graphml_path=None,
     include_parks=True,
     park_spacing=0.5,         # park lattice pitch as a multiple of avg edge length
 
@@ -1075,11 +1131,12 @@ def main(cfg=CONFIG):
     contour = extract_contour(cfg["svg_path"], cfg["img_size"])
     ranked = search_placement(contour, grid, cfg)   # [(cost, placed, route), ...]
     best_cost, best_placed, best_route = ranked[0]
+    save, show = cfg.get("save_plot"), cfg.get("show_plot", True)
 
     if not cfg.get("present_options"):
         _report("route", grid, best_placed, best_route)
-        plot(grid, best_placed, best_route)
-        return
+        plot(grid, best_placed, best_route, save=save, show=show)
+        return ranked
 
     if cfg["option_mode"] == "placements":
         # Different placements per panel -- pick the one whose street angles read best.
@@ -1091,8 +1148,41 @@ def main(cfg=CONFIG):
 
     for label, pl, rt in panels:
         _report(label, grid, pl, rt)
-    plot_options(grid, panels)
+    plot_options(grid, panels, save=save, show=show)
+    return ranked
+
+
+def _cli(argv=None):
+    """Command-line overrides for CONFIG, so a run like 'trace the star over
+    Chicago and save the plot' needs no source edits."""
+    import argparse
+    ap = argparse.ArgumentParser(description="SVG -> running route on real streets.")
+    ap.add_argument("--svg", help="path to the shape SVG")
+    ap.add_argument("--lat", type=float, help="network center latitude")
+    ap.add_argument("--lng", type=float, help="network center longitude")
+    ap.add_argument("--radius", type=float, dest="radius_m",
+                    help="network radius around the center, metres")
+    ap.add_argument("--graphml", help="load this saved GraphML instead of "
+                                      "fetching from the Overpass API")
+    ap.add_argument("--granularity", type=float,
+                    help="0=smooth/simple .. 1=trace every jog")
+    ap.add_argument("--seed", type=int, help="placement-search RNG seed")
+    ap.add_argument("--save", help="write the plot to this image path")
+    ap.add_argument("--no-show", action="store_true",
+                    help="don't open a window (headless; use with --save)")
+    args = ap.parse_args(argv)
+
+    cfg = dict(CONFIG)
+    for key, val in [("svg_path", args.svg), ("lat", args.lat), ("lng", args.lng),
+                     ("radius_m", args.radius_m), ("graphml_path", args.graphml),
+                     ("granularity", args.granularity), ("seed", args.seed),
+                     ("save_plot", args.save)]:
+        if val is not None:
+            cfg[key] = val
+    if args.no_show:
+        cfg["show_plot"] = False
+    return cfg
 
 
 if __name__ == "__main__":
-    main()
+    main(_cli())

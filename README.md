@@ -66,11 +66,28 @@ sudo apt-get install -y libegl1 libgl1
 ### Generate a route
 
 ```bash
-python gen.py
+python gen.py                                        # CONFIG defaults (Manhattan, star)
+python gen.py --svg shapes/Crow.svg --granularity 0.8
+python gen.py --lat 41.9285 --lng -87.7075 --save route.png --no-show
 ```
 
-Tune everything from the `CONFIG` dict in `gen.py` — location, search budget,
-granularity, and which shape (`svg_path`) to map.
+Every common knob is a CLI flag (`--svg`, `--lat/--lng/--radius`, `--granularity`,
+`--graphml`, `--seed`, `--save`, `--no-show`); everything else is tuned from the
+`CONFIG` dict in `gen.py`. `--graphml` loads a saved `ox.save_graphml` network
+instead of fetching from the Overpass API, for offline / reproducible runs.
+
+### Trace the shapes on the real Chicago street map
+
+[`chicago_map.py`](chicago_map.py) runs every bundled shape on the **real Chicago
+street network** (an OpenStreetMap citywide snapshot, downloaded once into `data/`)
+and renders each route on the actual OSMnx map, plus a gallery image, per-shape
+GeoJSON (WGS84) and a metrics CSV in `chicago_maps/`.
+
+```bash
+python chicago_map.py                    # all shapes, Logan Square window
+python chicago_map.py --shape star       # one shape
+python chicago_map.py --live             # fetch fresh OSM data instead
+```
 
 ### Benchmark fidelity across shapes
 

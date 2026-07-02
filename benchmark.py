@@ -38,7 +38,6 @@ from scipy.spatial import cKDTree
 import gen
 from gen import (
     Grid,
-    build_route,
     dtw,
     extract_contour,
     format_distance,
