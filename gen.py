@@ -261,12 +261,27 @@ def _add_park_mesh(graph, edge_list, parks, x_min, y_min, span, avg_edge, cfg):
 # --------------------------------------------------------------------------- #
 # Contour extraction                                                           #
 # --------------------------------------------------------------------------- #
-def extract_contour(svg_path, img_size):
-    """Render the SVG, trace its outer outline, return a closed [0, 1] polyline.
+@dataclass
+class Feature:
+    """One inner feature of a shape, in the same [0, 1] frame as the outline.
 
-    Y is flipped to a math-up axis so the outline aligns with the (north-up)
-    projected street grid.
+    closed=True  -- a loop (a hole like an eye, or a separate drawn element);
+    closed=False -- an open path (an interior detail stroke, e.g. a wing line),
+                    which routing can trace as an out-and-back.
     """
+    pts: np.ndarray
+    closed: bool
+
+
+@dataclass
+class ShapeSpec:
+    """A shape as the pipeline sees it: outer outline + inner features."""
+    outer: np.ndarray    # closed [0, 1] polyline (what placement seats on streets)
+    inners: list         # list[Feature], same coordinate frame as `outer`
+
+
+def _render_ink_mask(svg_path, img_size):
+    """Rasterize the SVG and return the binary ink mask (ink=255, paper=0)."""
     surface = skia.Surface(img_size, img_size)
     with surface as canvas:
         canvas.clear(skia.ColorWHITE)
@@ -280,6 +295,173 @@ def extract_contour(svg_path, img_size):
     arr = np.array(surface.makeImageSnapshot().toarray())
     gray = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY)
     _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    return binary
+
+
+def _norm_pts(pts_px, img_size):
+    """Pixel coords -> [0, 1] with Y flipped to a math-up axis (north-up grid)."""
+    pts_px = np.asarray(pts_px, dtype=np.float64)
+    return np.column_stack([pts_px[:, 0] / img_size, 1.0 - pts_px[:, 1] / img_size])
+
+
+def _cycle_runs(mask):
+    """Contiguous True runs on a cyclic boolean mask, as (start, stop) inclusive
+    index pairs in original order (stop may wrap below start). None if all True."""
+    n = len(mask)
+    if mask.all():
+        return None
+    if not mask.any():
+        return []
+    start = int(np.argmin(mask))               # rotate so position 0 is False
+    m = np.roll(mask, -start)
+    runs, i = [], 0
+    while i < n:
+        if m[i]:
+            j = i
+            while j < n and m[j]:
+                j += 1
+            runs.append(((i + start) % n, (j - 1 + start) % n))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def _cycle_slice(pts, a, b):
+    """pts[a..b] inclusive on a cyclic array (handles wrap-around)."""
+    return pts[a:b + 1] if a <= b else np.vstack([pts[a:], pts[:b + 1]])
+
+
+def _arc_len(pts):
+    return float(np.linalg.norm(np.diff(np.asarray(pts, np.float64), axis=0),
+                                axis=1).sum())
+
+
+def extract_shape(svg_path, img_size, min_perimeter=0.05, dup_tol=None):
+    """Render the SVG and extract the outer outline AND its inner features.
+
+    The outer outline is what the old extract_contour returned (flood-filled
+    solid silhouette, largest external contour). Inner features are everything
+    the silhouette step used to throw away, found from the full ink/paper
+    contour *tree* of the raw mask (depth alternates ink edge / hole):
+
+      * depth 0 besides the main outline  -- completely disconnected elements;
+      * even depth >= 2                   -- ink drawn inside a hole (an eye dot,
+                                             an emblem), also possibly disconnected
+                                             from the outer contour;
+      * odd depth (white pockets)         -- classified against their parent
+        ink edge. A pocket much shorter than its parent (< 35% of its arc) can
+        only be a true hole (a shark's eye, a donut hole) and is kept closed.
+        A parent-sized pocket is either the interior of a stroked outline (it
+        shadows the parent at pen-stroke distance everywhere -> dropped), a fat
+        ring's hole (it sits far from the parent everywhere -> kept closed), or
+        an interior partitioned by detail strokes -- then exactly the arcs that
+        deviate from the parent are kept as OPEN paths: those arcs run along
+        the drawn interior lines (a wing line, a mane).
+
+    Finally near-duplicates are removed (the two edges of one stroked line, or
+    the same dividing stroke seen from two adjacent pockets): any feature lying
+    entirely within the stroke-width tolerance of a longer kept feature (or of
+    the outline) is dropped.
+
+    `min_perimeter` (in [0, 1] units) filters raster noise; `dup_tol` (same
+    units) overrides the stroke-width-derived duplicate tolerance.
+    """
+    binary = _render_ink_mask(svg_path, img_size)
+
+    # Outer outline: identical to the historical behaviour (solidify, then the
+    # largest external contour).
+    holes = binary.copy()
+    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
+    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
+    ext, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not ext:
+        raise ValueError(f"no drawable outline found in {svg_path!r} "
+                         "(empty or unsupported SVG)")
+    outer = _close(_norm_pts(max(ext, key=cv2.contourArea)[:, 0, :], img_size))
+
+    # Full boundary tree of the raw ink mask, at pixel density.
+    contours, hier = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    if hier is None:
+        return ShapeSpec(outer, [])
+    hier = hier[0]
+    pts_of = [c[:, 0, :].astype(np.float64) for c in contours]
+    depth = []
+    for i in range(len(contours)):
+        d, p = 0, hier[i][3]
+        while p != -1:
+            d, p = d + 1, hier[p][3]
+        depth.append(d)
+    main = max((i for i in range(len(contours)) if depth[i] == 0),
+               key=lambda i: cv2.contourArea(contours[i]))
+
+    if dup_tol is None:
+        # Pen-stroke thickness ~ 4x the median ink-pixel depth (a stroke's
+        # distance-to-paper profile is triangular, so its median is ~1/4 of the
+        # full thickness). Capped for filled shapes, where ink depth is
+        # body-scale rather than stroke-scale.
+        dt = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+        ink = dt[binary > 0]
+        thickness = 4.0 * float(np.median(ink)) if len(ink) else 0.0
+        tol_px = min(1.3 * thickness, 0.04 * img_size)
+    else:
+        tol_px = dup_tol * img_size
+    min_px = min_perimeter * img_size
+
+    candidates = []                                # (pts_px, closed)
+    for i, pts in enumerate(pts_of):
+        d = depth[i]
+        if i == main or len(pts) < 4:
+            continue
+        if d % 2 == 0:                             # ink edge: a drawn element
+            if _arc_len(pts) + np.linalg.norm(pts[0] - pts[-1]) >= min_px:
+                candidates.append((pts, True))
+            continue
+        # White pocket: hole, stroked-outline interior, or detail-stroke carrier?
+        parent = pts_of[hier[i][3]]
+        if _arc_len(pts) < 0.35 * _arc_len(parent):
+            candidates.append((pts, True))         # far too short to be "the
+            continue                               # interior": a true hole
+        # Parent-sized pocket. Its hugging distance (low percentile of the
+        # point distances to the parent) is the local pen-stroke gap; deviation
+        # beyond that marks drawn interior lines. The parent-extent cap keeps a
+        # fat ring's hole (donut) from being mistaken for a shadowing interior.
+        dist = cKDTree(parent).query(pts)[0]
+        extent = float(max(np.ptp(parent[:, 0]), np.ptp(parent[:, 1])))
+        tol_pocket = min(1.6 * float(np.percentile(dist, 15)), 0.15 * extent)
+        runs = _cycle_runs(dist > tol_pocket)
+        if runs is None:                           # far from parent everywhere:
+            candidates.append((pts, True))         # a real hole (donut)
+            continue
+        for a, b in runs:
+            seg = _cycle_slice(pts, a, b)
+            if _arc_len(seg) >= min_px:
+                candidates.append((seg, False))    # interior detail stroke
+
+    # Drop near-duplicates: longest first, keep a feature only if some part of
+    # it is farther than tol from everything kept so far (incl. the outline).
+    candidates.sort(key=lambda t: -_arc_len(t[0]))
+    kept, refs = [], [pts_of[main]]
+    for pts, closed in candidates:
+        if any(cKDTree(r).query(pts)[0].max() < tol_px for r in refs):
+            continue
+        kept.append((pts, closed))
+        refs.append(pts)
+
+    inners = [Feature(_close(_norm_pts(p, img_size)) if closed
+                      else _norm_pts(p, img_size), closed)
+              for p, closed in kept]
+    return ShapeSpec(outer, inners)
+
+
+def extract_contour(svg_path, img_size):
+    """Render the SVG, trace its outer outline, return a closed [0, 1] polyline.
+
+    Y is flipped to a math-up axis so the outline aligns with the (north-up)
+    projected street grid. (Outline only -- use extract_shape() to also get the
+    inner features.)
+    """
+    binary = _render_ink_mask(svg_path, img_size)
 
     # Flood from a corner then OR back in, so interior holes are treated as solid.
     holes = binary.copy()
@@ -291,8 +473,7 @@ def extract_contour(svg_path, img_size):
         raise ValueError(f"no drawable outline found in {svg_path!r} "
                          "(empty or unsupported SVG)")
     outer = max(contours, key=cv2.contourArea)
-    pts = np.array([[p[0][0] / img_size, 1.0 - p[0][1] / img_size] for p in outer])
-    return _close(pts)
+    return _close(_norm_pts(outer[:, 0, :], img_size))
 
 
 
@@ -1071,6 +1252,11 @@ CONFIG = dict(
     # SVG raster size for contour tracing.
     img_size=2048,
 
+    # Inner features (holes, separate elements, interior detail strokes) are
+    # extracted alongside the outline by extract_shape; features whose length
+    # is below this fraction of the [0, 1] frame are treated as raster noise.
+    inner_min_perimeter=0.05,
+
     # Placement search.
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
     aspect_max=1.5,           # max area-preserving stretch (1.0 = uniform scale)
@@ -1128,7 +1314,13 @@ CONFIG = dict(
 
 def main(cfg=CONFIG):
     grid = build_grid(cfg)
-    contour = extract_contour(cfg["svg_path"], cfg["img_size"])
+    spec = extract_shape(cfg["svg_path"], cfg["img_size"],
+                         min_perimeter=cfg["inner_min_perimeter"])
+    contour = spec.outer
+    if spec.inners:
+        n_open = sum(1 for f in spec.inners if not f.closed)
+        print(f"inner features: {len(spec.inners)} "
+              f"({len(spec.inners) - n_open} closed loop(s), {n_open} open path(s))")
     ranked = search_placement(contour, grid, cfg)   # [(cost, placed, route), ...]
     best_cost, best_placed, best_route = ranked[0]
     save, show = cfg.get("save_plot"), cfg.get("show_plot", True)

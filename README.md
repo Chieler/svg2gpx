@@ -138,6 +138,26 @@ Sample SVGs live in [`shapes/`](shapes): `square`, `circle`, `lshape`, `star`.
 Drop any `<polygon>` / `<path>` SVG in there and the benchmark and Action pick it up
 automatically — no code changes needed.
 
+### Inner features
+
+Shapes are more than their outer silhouette. `extract_shape()` in `gen.py` also
+finds the SVG's **inner features**, classified from the raster's ink/paper contour
+tree, whether or not they touch the outer contour:
+
+- **holes** — a donut's hole, a shark's eye (closed loops);
+- **disconnected inner elements** — a smiley's eyes and mouth, drawn entirely
+  separate from the outer ring (closed loops);
+- **interior detail strokes** in line art — a wing line, a horse's mane — found as
+  the arcs where an interior region's boundary deviates from the outline it shadows
+  (open paths, runnable as out-and-back spurs).
+
+`extract_contour()` still returns just the outer outline, so existing callers are
+unchanged. Visual check: `python preview_features.py` (writes
+`inner_features_preview.png`); correctness checks: `python test_inner_features.py`.
+Placement + routing of the inner features is the next step: the chosen placement
+transform applies to them verbatim, closed features route as separate loops and
+open ones as out-and-back spurs.
+
 ## Repository layout
 
 ```
