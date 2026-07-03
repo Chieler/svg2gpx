@@ -682,48 +682,95 @@ def _feat_deviation(route, target):
 
 
 def refine_feature(grid, fp0, closed, cfg):
-    """Locally refine one placed feature: small translate/scale variants.
+    """Tailor one placed feature to the street fabric around its drawn spot.
 
-    The outer placement is chosen for the whole shape, so a small feature can
-    land astride a block with no street where its outline runs -- or be below
-    street resolution outright (an eye drawn at 2% of the shape spans less
-    than a block). This routes a small family of variants and keeps the best:
+    The global placement seats the OUTER contour; a small feature can land
+    astride a block where nothing matches its outline even though a perfect
+    seat exists one street over. So rather than blind nudges, search the local
+    fabric, mirroring the outer two-stage search in miniature:
 
-      * shifts -- identity, the centroid snapped to the nearest street node,
-        and four half-block nudges;
-      * scales -- 1.0, a mild 1.2, and (for a feature narrower than
-        `inner_min_span_blocks` street edges) a rescue upscale to that span,
-        capped at `inner_max_inflate`x, because a slightly-too-big eye that
-        READS beats a faithful one that can't be drawn.
+      * positions -- the drawn centroid plus every street node within
+        `inner_search_radius` x the feature's span (a few blocks minimum),
+      * rotations -- 0 and +/- `inner_rot_deg` (small, so an eyebrow stays an
+        eyebrow),
+      * scales -- 0.9 .. 1.35, plus a rescue upscale for a feature narrower
+        than `inner_min_span_blocks` street edges (capped `inner_max_inflate`x;
+        a slightly-too-big eye that READS beats a faithful invisible one).
 
-    Deviation is measured against each variant's own (moved/scaled) target, so
-    a bigger target must pay its own way: inflation only wins when it actually
-    unlocks a better route (a real loop instead of a 3-node stub). A drift
-    penalty keeps features where the drawing put them. Returns (target, route).
+    Every variant gets a cheap street-fit proxy: snap closeness, on-street
+    coverage, and crucially how many DISTINCT nodes the outline resolves to --
+    tiny features die by collapsing onto one node. The proxy's best few are
+    actually routed; the winner minimizes routed deviation (against its own
+    moved target, so a bigger target must pay its own way) plus a drift
+    penalty that anchors the feature to where the drawing put it.
+    Returns (target, route) -- the original, unrouted, on failure.
     """
     e = grid.avg_edge
     c0 = fp0.mean(axis=0)
-    _, k = grid.tree.query(c0)
-    snap = grid.nodes_arr[int(k)] - c0
-    shifts = [np.zeros(2), snap,
-              np.array([0.5 * e, 0.0]), np.array([-0.5 * e, 0.0]),
-              np.array([0.0, 0.5 * e]), np.array([0.0, -0.5 * e])]
     span = float(max(np.ptp(fp0[:, 0]), np.ptp(fp0[:, 1])))
-    scales = {1.0, 1.2}
+    if span <= 0.0:
+        return fp0, []
+    proxy_pts = resample(fp0, n=48, closed=closed) - c0    # centered template
+
+    # Candidate seats: the drawn spot plus nearby street nodes, nearest first.
+    radius = max(cfg.get("inner_search_radius", 1.0) * span, 3.0 * e)
+    near = grid.tree.query_ball_point(c0, radius)
+    nodes = grid.nodes_arr[near]
+    if len(nodes):
+        order = np.argsort(np.linalg.norm(nodes - c0, axis=1))
+        nodes = nodes[order[:36]]                          # cap the fan-out
+    centers = [c0] + list(nodes)
+
+    rot = np.radians(cfg.get("inner_rot_deg", 12.0))
+    rots = (0.0, rot, -rot) if rot > 0 else (0.0,)
+    scales = {0.9, 1.0, 1.15, 1.35}
     min_span = cfg.get("inner_min_span_blocks", 6.0) * e
-    if 0.0 < span < min_span:
+    if span < min_span:
         scales.add(min(min_span / span, cfg.get("inner_max_inflate", 3.0)))
+
+    rescue = max(scales) if span < min_span else None
+    scored = []
+    for a in rots:
+        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        rotated = proxy_pts @ R.T
+        for s in sorted(scales):
+            base = rotated * s
+            for c in centers:
+                p = base + c
+                d, nn = grid.tree.query(p)
+                closeness = 1.0 / (1.0 + float(d.mean()) / e)
+                coverage = float(np.mean(d < 0.5 * e))
+                # Distinct snapped nodes, absolute: below ~12 a loop can't
+                # look like anything, however faithfully it sits.
+                resolve = min(len(np.unique(nn)) / 12.0, 1.0)
+                shift = float(np.hypot(*(c - c0)))
+                proxy = (0.40 * closeness + 0.25 * coverage + 0.35 * resolve
+                         - 0.3 * shift / max(span, e))
+                drift = shift + 0.15 * abs(s - 1.0) * span
+                scored.append((proxy, a, s, c, drift))
+    scored.sort(key=lambda t: -t[0])
+
+    # Route the proxy's favourites, but structurally guarantee two fallbacks a
+    # mistuned proxy must never starve: the drawn identity variant, and (for a
+    # sub-resolution feature) the best-ranked rescue-scale variant.
+    chosen = list(scored[:cfg.get("inner_route_eval", 6)])
+    identity = next(t for t in scored if t[2] == 1.0 and t[1] == 0.0
+                    and t[3] is centers[0])
+    if identity not in chosen:
+        chosen.append(identity)
+    if rescue is not None and not any(t[2] == rescue for t in chosen):
+        chosen.append(next(t for t in scored if t[2] == rescue))
+
     best = None
-    for s in sorted(scales):
-        for sh in shifts:
-            fp = (fp0 - c0) * s + c0 + sh
-            fr = build_feature_route(grid, fp, closed, cfg)
-            if len(fr) < 2:
-                continue
-            drift = float(np.hypot(*sh)) + 0.15 * (s - 1.0) * span
-            score = _feat_deviation(fr, fp) + 0.3 * drift
-            if best is None or score < best[0]:
-                best = (score, fp, fr)
+    for proxy, a, s, c, drift in chosen:
+        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        fp = (fp0 - c0) @ R.T * s + c
+        fr = build_feature_route(grid, fp, closed, cfg)
+        if len(fr) < 2:
+            continue
+        score = _feat_deviation(fr, fp) + 0.3 * drift
+        if best is None or score < best[0]:
+            best = (score, fp, fr)
     if best is None:
         return fp0, []
     return best[1], best[2]
@@ -1467,16 +1514,21 @@ CONFIG = dict(
     # itself bounded by the features' share of total drawn length).
     inner_features=True,
     inner_cost_weight=0.6,
-    # Small-feature rescue. Features below street resolution can't be drawn as
-    # placed: inflate any feature narrower than this many average street edges
-    # up to that span (about its own centroid, at most inner_max_inflate x),
-    # then locally refine each feature -- snap/nudge/upscale variants are
-    # routed and the best-hugging one wins, drift-penalized so features stay
-    # where the drawing put them. inner_min_span_blocks=0 / inner_refine=False
-    # disable the two steps.
+    # Per-feature tailoring (refine_feature). Each placed feature is re-seated
+    # on the local street fabric: candidate positions are the drawn spot plus
+    # street nodes within inner_search_radius x the feature's span, tried at
+    # small rotations (+/- inner_rot_deg) and a ladder of scales, including a
+    # rescue upscale for features narrower than inner_min_span_blocks street
+    # edges (capped at inner_max_inflate x). A cheap street-fit proxy ranks
+    # the variants, the best inner_route_eval are routed, and a drift penalty
+    # anchors features to where the drawing put them. inner_refine=False
+    # disables all of it.
+    inner_refine=True,
+    inner_search_radius=1.0,
+    inner_rot_deg=12.0,
+    inner_route_eval=6,
     inner_min_span_blocks=6.0,
     inner_max_inflate=3.0,
-    inner_refine=True,
 
     # Placement search.
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span

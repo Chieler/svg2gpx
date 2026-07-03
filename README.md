@@ -173,12 +173,19 @@ barely a city block:
   shape and would legally shortcut a small eye into a triangle; feature routing
   raises the effective granularity until the slack is a small fraction of the
   feature's own span;
-- **local refinement** (`refine_feature`, `inner_refine`) — each feature also tries
-  snapping its centroid to a street node, four half-block nudges, and (below
-  `inner_min_span_blocks` street edges) a rescue upscale capped at
-  `inner_max_inflate`×; every variant is routed and the best-hugging one wins,
-  drift-penalized so features stay where the drawing put them. A bigger target
-  must pay its own way, so useless inflation loses.
+- **street-tailored refinement** (`refine_feature`, `inner_refine`) — each feature
+  is re-seated on the street fabric around its drawn spot, mirroring the outer
+  two-stage search in miniature: candidate positions are the drawn centroid plus
+  every street node within `inner_search_radius`× the feature's span, tried at
+  small rotations (±`inner_rot_deg`) and a ladder of scales including a rescue
+  upscale for features narrower than `inner_min_span_blocks` street edges (capped
+  `inner_max_inflate`×). A cheap street-fit proxy — snap closeness, coverage, and
+  how many *distinct* nodes the outline resolves to (tiny features die by
+  collapsing onto one node) — ranks the variants; the best `inner_route_eval` are
+  actually routed (the drawn identity and the best rescue variant are always
+  among them), and the winner minimizes routed deviation plus a drift penalty
+  that anchors the feature to where the drawing put it. A bigger or moved target
+  must pay its own way, so useless inflation and wandering lose.
 
 Toggle everything with `inner_features=False` in CONFIG or `--no-inner-features`
 on `gen.py` / `chicago_map.py`.
