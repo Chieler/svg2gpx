@@ -156,16 +156,32 @@ unchanged. Visual check: `python preview_features.py` (writes
 `inner_features_preview.png`); correctness checks: `python test_inner_features.py`.
 
 The features are then **placed and routed** with the outer contour: every feature
-is transformed with the exact placement chosen for the outline (same pivot), closed
-features route as their own loops and open ones as out-and-back spurs
-(`build_feature_route`). And because features are only useful when the contour is
-good, the placement search's second stage — the top `n_route_eval` routed
-candidates — folds each candidate's **feature fidelity into its cost**
-(`feature_cost`): the per-feature routed deviation (1.0 for a feature that is
-off-grid or below street resolution), size-weighted and bounded by the features'
-share of total drawn length, scaled by `inner_cost_weight`. A placement whose
-contour seats nicely but strands the eye now ranks below one that draws both.
-Disable with `inner_features=False`.
+gets the exact affine chosen for the outline (scale, rotation, aspect, shear —
+about the same pivot), closed features route as their own loops and open ones as
+out-and-back spurs (`build_feature_route`). And because features are only useful
+when the contour is good, the placement search's second stage — the top
+`n_route_eval` routed candidates — folds each candidate's **feature fidelity into
+its cost** (`feature_cost`): the per-feature routed deviation (1.0 for a feature
+that is off-grid or below street resolution), size-weighted and bounded by the
+features' share of total drawn length, scaled by `inner_cost_weight`. A placement
+whose contour seats nicely but strands the eye now ranks below one that draws both.
+
+Small features get two extra rescues, since an eye drawn at 2% of the shape spans
+barely a city block:
+
+- **feature-scaled smoothing** — cleanup's corner-cut slack is sized for the outer
+  shape and would legally shortcut a small eye into a triangle; feature routing
+  raises the effective granularity until the slack is a small fraction of the
+  feature's own span;
+- **local refinement** (`refine_feature`, `inner_refine`) — each feature also tries
+  snapping its centroid to a street node, four half-block nudges, and (below
+  `inner_min_span_blocks` street edges) a rescue upscale capped at
+  `inner_max_inflate`×; every variant is routed and the best-hugging one wins,
+  drift-penalized so features stay where the drawing put them. A bigger target
+  must pay its own way, so useless inflation loses.
+
+Toggle everything with `inner_features=False` in CONFIG or `--no-inner-features`
+on `gen.py` / `chicago_map.py`.
 
 ## Repository layout
 

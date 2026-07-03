@@ -277,6 +277,9 @@ def main():
     ap.add_argument("--radius", type=float, default=RADIUS_M)
     ap.add_argument("--live", action="store_true",
                     help="fetch fresh OSM data instead of the bundled snapshot")
+    ap.add_argument("--no-inner-features", action="store_true",
+                    help="outline only: skip placing/routing/scoring the "
+                         "shapes' inner features")
     ap.add_argument("--outdir", default=os.path.join(HERE, "chicago_maps"))
     args = ap.parse_args()
 
@@ -292,6 +295,8 @@ def main():
     cfg = dict(gen.CONFIG)
     cfg.update(lat=args.lat, lng=args.lng, radius_m=args.radius,
                include_parks=False)   # snapshot has no park polygons
+    if args.no_inner_features:
+        cfg["inner_features"] = False
 
     grid, G_proj = build_chicago_grid(cfg, live=args.live)
     edges_gdf = ox.graph_to_gdfs(G_proj, nodes=False)

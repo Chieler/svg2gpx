@@ -651,7 +651,20 @@ def build_feature_route(grid, placed_feat, closed, cfg):
     and returns the same way (out-and-back), so the routed polyline is the
     single pass. Returns [] when the feature is too small to resolve on this
     grid (e.g. an eye smaller than a block).
+
+    Cleanup's corner-cut slack is sized in street-edge units for the OUTER
+    shape; on a feature a few blocks wide that budget spans the whole feature
+    and shortcut_nooks would legally smooth an eye into a triangle. Raise the
+    effective granularity until the slack is a small fraction of the feature's
+    own span (never below the configured granularity, so big features keep the
+    user's smoothing).
     """
+    span = float(max(np.ptp(placed_feat[:, 0]), np.ptp(placed_feat[:, 1])))
+    full = grid.avg_edge * 3.5                      # slack at granularity 0
+    g = cfg["granularity"]
+    if full > 0 and 0.12 * span < full * (1.0 - g) ** 0.6:
+        g_feat = 1.0 - (0.12 * span / full) ** (1.0 / 0.6)
+        cfg = {**cfg, "granularity": float(np.clip(g_feat, g, 1.0))}
     dense, waypoints, wp_idx = snap_waypoints(placed_feat, grid, cfg, closed=closed)
     if len(waypoints) < (3 if closed else 2):
         return []
@@ -660,16 +673,78 @@ def build_feature_route(grid, placed_feat, closed, cfg):
     return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed)
 
 
+def _feat_deviation(route, target):
+    """Mean two-way deviation between a feature's route and its target."""
+    r = np.asarray(route, np.float64)
+    t = np.asarray(target, np.float64)
+    return 0.5 * (float(cKDTree(r).query(t)[0].mean())
+                  + float(cKDTree(t).query(r)[0].mean()))
+
+
+def refine_feature(grid, fp0, closed, cfg):
+    """Locally refine one placed feature: small translate/scale variants.
+
+    The outer placement is chosen for the whole shape, so a small feature can
+    land astride a block with no street where its outline runs -- or be below
+    street resolution outright (an eye drawn at 2% of the shape spans less
+    than a block). This routes a small family of variants and keeps the best:
+
+      * shifts -- identity, the centroid snapped to the nearest street node,
+        and four half-block nudges;
+      * scales -- 1.0, a mild 1.2, and (for a feature narrower than
+        `inner_min_span_blocks` street edges) a rescue upscale to that span,
+        capped at `inner_max_inflate`x, because a slightly-too-big eye that
+        READS beats a faithful one that can't be drawn.
+
+    Deviation is measured against each variant's own (moved/scaled) target, so
+    a bigger target must pay its own way: inflation only wins when it actually
+    unlocks a better route (a real loop instead of a 3-node stub). A drift
+    penalty keeps features where the drawing put them. Returns (target, route).
+    """
+    e = grid.avg_edge
+    c0 = fp0.mean(axis=0)
+    _, k = grid.tree.query(c0)
+    snap = grid.nodes_arr[int(k)] - c0
+    shifts = [np.zeros(2), snap,
+              np.array([0.5 * e, 0.0]), np.array([-0.5 * e, 0.0]),
+              np.array([0.0, 0.5 * e]), np.array([0.0, -0.5 * e])]
+    span = float(max(np.ptp(fp0[:, 0]), np.ptp(fp0[:, 1])))
+    scales = {1.0, 1.2}
+    min_span = cfg.get("inner_min_span_blocks", 6.0) * e
+    if 0.0 < span < min_span:
+        scales.add(min(min_span / span, cfg.get("inner_max_inflate", 3.0)))
+    best = None
+    for s in sorted(scales):
+        for sh in shifts:
+            fp = (fp0 - c0) * s + c0 + sh
+            fr = build_feature_route(grid, fp, closed, cfg)
+            if len(fr) < 2:
+                continue
+            drift = float(np.hypot(*sh)) + 0.15 * (s - 1.0) * span
+            score = _feat_deviation(fr, fp) + 0.3 * drift
+            if best is None or score < best[0]:
+                best = (score, fp, fr)
+    if best is None:
+        return fp0, []
+    return best[1], best[2]
+
+
 def route_features(grid, inners, params, center, cfg):
     """Place every inner feature with the outer contour's transform and route it.
 
-    `center` is the outer contour's centroid: features share the outline's
-    pivot so they land where the drawing put them.
+    `center` is the outer contour's centroid: features get the full affine the
+    outline got (scale, rotation, aspect, shear) about the same pivot, so they
+    land where the drawing put them. Each feature is then locally refined --
+    snap/nudge/rescue-upscale variants, best routed one wins (refine_feature).
     """
     feats = []
     for f in inners:
         fp = place(f.pts, *params, center=center)
-        feats.append((f, fp, build_feature_route(grid, fp, f.closed, cfg)))
+        if cfg.get("inner_refine", True):
+            fp, fr = refine_feature(grid, fp, f.closed, cfg)
+        else:
+            fr = build_feature_route(grid, fp, f.closed, cfg)
+        feats.append((f, fp, fr))
     return feats
 
 
@@ -692,11 +767,7 @@ def feature_cost(grid, placed_outer, feats):
         if len(fr) < 2:
             costs.append(1.0)
             continue
-        r = np.asarray(fr, np.float64)
-        t = np.asarray(fp, np.float64)
-        dev = 0.5 * (float(cKDTree(r).query(t)[0].mean())
-                     + float(cKDTree(t).query(r)[0].mean()))
-        costs.append(min(dev / (3.0 * grid.avg_edge), 1.0))
+        costs.append(min(_feat_deviation(fr, fp) / (3.0 * grid.avg_edge), 1.0))
     total = float(sum(sizes))
     if total <= 0.0:
         return 0.0, 0.0
@@ -1396,6 +1467,16 @@ CONFIG = dict(
     # itself bounded by the features' share of total drawn length).
     inner_features=True,
     inner_cost_weight=0.6,
+    # Small-feature rescue. Features below street resolution can't be drawn as
+    # placed: inflate any feature narrower than this many average street edges
+    # up to that span (about its own centroid, at most inner_max_inflate x),
+    # then locally refine each feature -- snap/nudge/upscale variants are
+    # routed and the best-hugging one wins, drift-penalized so features stay
+    # where the drawing put them. inner_min_span_blocks=0 / inner_refine=False
+    # disable the two steps.
+    inner_min_span_blocks=6.0,
+    inner_max_inflate=3.0,
+    inner_refine=True,
 
     # Placement search.
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
@@ -1509,6 +1590,9 @@ def _cli(argv=None):
     ap.add_argument("--save", help="write the plot to this image path")
     ap.add_argument("--no-show", action="store_true",
                     help="don't open a window (headless; use with --save)")
+    ap.add_argument("--no-inner-features", action="store_true",
+                    help="outline only: skip placing/routing/scoring the "
+                         "shape's inner features")
     args = ap.parse_args(argv)
 
     cfg = dict(CONFIG)
@@ -1520,6 +1604,8 @@ def _cli(argv=None):
             cfg[key] = val
     if args.no_show:
         cfg["show_plot"] = False
+    if args.no_inner_features:
+        cfg["inner_features"] = False
     return cfg
 
 
