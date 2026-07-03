@@ -566,7 +566,8 @@ def waypoint_importance(pts, k=4):
 # --------------------------------------------------------------------------- #
 # Placement search                                                            #
 # --------------------------------------------------------------------------- #
-def _score(placed, grid, scale, cfg, importance):
+def _score(placed, grid, scale, cfg, importance,
+           feat_pts=None, feat_w=None, feat_share=0.0):
     """How routable a placement is, weighted by how much each point matters.
 
     Coverage and snap distance are weighted by `importance`, so seating a flat
@@ -574,6 +575,13 @@ def _score(placed, grid, scale, cfg, importance):
     A dedicated worst-feature term makes the score collapse if any high-importance
     point is left off-grid -- this is what stops the search from cheating
     protrusions to make the bulk body sit prettily.
+
+    When the shape has inner features, `feat_pts` carries a few sample points
+    per feature placed with the same transform (weighted by feature size via
+    `feat_w`). Their snap closeness and node resolvability join the score as a
+    bonus scaled by `feat_share` (the features' share of drawn length), so
+    stage 1 already prefers placements whose eyes land on streets -- otherwise
+    the expensive stage 2 may never get to see a feature-friendly candidate.
     """
     m = cfg["margin"]
     if placed.min() < m or placed.max() > 1 - m:
@@ -609,8 +617,16 @@ def _score(placed, grid, scale, cfg, importance):
     orientation = float(np.sum(w * quality) / np.sum(w))
     s_lo, s_hi = cfg["scale_range"]
     bigness = (scale - s_lo) / (s_hi - s_lo)               # prefer larger
-    return (0.22 * coverage + 0.15 * closeness + 0.20 * feature
-            + 0.13 * resolvable + 0.18 * orientation + 0.12 * bigness)
+    score = (0.22 * coverage + 0.15 * closeness + 0.20 * feature
+             + 0.13 * resolvable + 0.18 * orientation + 0.12 * bigness)
+    if feat_pts is not None and len(feat_pts):
+        fd, fnn = grid.tree.query(feat_pts)
+        feat_close = 1.0 / (1.0 + float(np.average(fd, weights=feat_w))
+                            / grid.avg_edge)
+        feat_resolve = len(np.unique(fnn)) / len(feat_pts)
+        score += (cfg.get("inner_proxy_weight", 0.15) * feat_share
+                  * (0.6 * feat_close + 0.4 * feat_resolve))
+    return score
 
 
 def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
@@ -846,9 +862,26 @@ def search_placement(contour, grid, cfg, inners=None):
     ln_a = np.log(cfg["aspect_max"])
     shm = cfg["shear_max"]
 
+    # A few sample points per inner feature, placed with the outline's pivot,
+    # so the stage-1 proxy can score feature seating too (see _score).
+    inners = inners or []
+    base_center = base.mean(axis=0)
+    probe_feats, feat_w, feat_share = None, None, 0.0
+    if inners:
+        samples = [resample(f.pts, n=8, closed=f.closed)[:-1 if f.closed else None]
+                   for f in inners]
+        sizes = np.array([max(_arc_len(f.pts), 1e-9) for f in inners])
+        probe_feats = np.vstack(samples)
+        feat_w = np.concatenate([np.full(len(s), sz)
+                                 for s, sz in zip(samples, sizes)])
+        feat_share = min(float(sizes.sum()) / max(_arc_len(base), 1e-9), 1.0)
+
     def trial(scale, rot, dx, dy, aspect, shear):
         cand = place(base, scale, rot, dx, dy, aspect, shear)
-        return (_score(cand, grid, scale, cfg, importance),
+        fp = (place(probe_feats, scale, rot, dx, dy, aspect, shear,
+                    center=base_center)
+              if probe_feats is not None else None)
+        return (_score(cand, grid, scale, cfg, importance, fp, feat_w, feat_share),
                 (scale, rot, dx, dy, aspect, shear))
 
     results = [trial(rng.uniform(s_lo, s_hi), rng.uniform(0, 360),
@@ -872,7 +905,6 @@ def search_placement(contour, grid, cfg, inners=None):
     # don't waste the budget on near-identical refinements), score each by the
     # perceptual placement cost (blurred render-compare) plus, when the shape
     # has inner features, their routed fidelity -- and return them ranked.
-    inners = inners or []
     center = np.asarray(contour, np.float64).mean(axis=0)
     w_inner = cfg.get("inner_cost_weight", 0.6)
     routed, tried, chosen_params = [], 0, []
@@ -983,11 +1015,17 @@ def _polyline_dist_fn(seg):
     return dist
 
 
-def route_pair(graph, src, dst, seg, weight):
+def route_pair(graph, src, dst, seg, weight, best_effort=False):
     """Dijkstra from src to dst, penalizing distance from the local outline arc.
 
     Cost = edge_length + weight * distance_to_outline(neighbor). With weight >> 1
     and a short local `seg`, the cheapest path is the one that stays on the line.
+
+    best_effort: when dst is unreachable (a disconnected pocket -- a park-mesh
+    island, a clipped component), return the path to the reachable node nearest
+    to dst (the closest approach) instead of []. The caller continues from that
+    node, so the assembled route stays a connected walk on real edges rather
+    than teleporting across the gap.
     """
     if src == dst:
         return [src]
@@ -1018,7 +1056,13 @@ def route_pair(graph, src, dst, seg, weight):
                 heapq.heappush(heap, (nc, c, v))
                 c += 1
     if dst not in prev:
-        return []
+        if not best_effort or not seen:
+            return []
+        # dst is in another component: bridge to the closest approach instead.
+        reached = list(seen)
+        arr = np.asarray(reached, dtype=np.float64)
+        dst = reached[int(np.argmin(np.hypot(arr[:, 0] - dst[0],
+                                             arr[:, 1] - dst[1])))]
     path, u = [], dst
     while u is not None:
         path.append(u)
@@ -1027,16 +1071,30 @@ def route_pair(graph, src, dst, seg, weight):
 
 
 def route_contour(grid, dense, waypoints, wp_idx, weight):
-    """Chain route_pair across all waypoints, sharing junction nodes."""
-    route = []
-    for i in range(len(waypoints) - 1):
-        seg = dense[wp_idx[i]:wp_idx[i + 1] + 1]
+    """Chain route_pair across all waypoints, sharing junction nodes.
+
+    An unreachable waypoint (a disconnected pocket in the graph) doesn't break
+    the chain: its leg bridges to the reachable node nearest the target and
+    the next leg continues from wherever the route actually ended -- so the
+    result is always a connected walk on real edges, never a straight-line
+    teleport that would be counted as if it were run.
+    """
+    route, bridged = [], 0
+    cur = waypoints[0]
+    for i in range(1, len(waypoints)):
+        seg = dense[wp_idx[i - 1]:wp_idx[i] + 1]
         if len(seg) < 2:
-            seg = np.array([waypoints[i], waypoints[i + 1]])
-        part = route_pair(grid.graph, waypoints[i], waypoints[i + 1], seg, weight)
+            seg = np.array([cur, waypoints[i]])
+        part = route_pair(grid.graph, cur, waypoints[i], seg, weight,
+                          best_effort=True)
         if not part:
             continue
         route.extend(part[1:] if route else part)
+        cur = route[-1]
+        if cur != waypoints[i]:
+            bridged += 1
+    if bridged:
+        print(f"  bridged {bridged} unreachable waypoint(s) at closest approach")
     return route
 
 
@@ -1158,7 +1216,8 @@ def close_loop(grid, route, dense, wp_idx, weight):
     if len(route) < 2 or route[-1] == route[0]:
         return route
     seg = np.vstack([dense[wp_idx[-1]:], dense[:wp_idx[0] + 1]])
-    closing = route_pair(grid.graph, route[-1], route[0], seg, weight)
+    closing = route_pair(grid.graph, route[-1], route[0], seg, weight,
+                         best_effort=True)
     return route + closing[1:] if closing else route
 
 
@@ -1514,6 +1573,11 @@ CONFIG = dict(
     # itself bounded by the features' share of total drawn length).
     inner_features=True,
     inner_cost_weight=0.6,
+    # Stage-1 proxy bonus for placements that seat the inner features well
+    # (snap closeness + node resolvability of a few sample points per feature,
+    # scaled by the features' share of drawn length). Keeps feature-friendly
+    # placements alive into stage 2, where the full routed feature cost rules.
+    inner_proxy_weight=0.15,
     # Per-feature tailoring (refine_feature). Each placed feature is re-seated
     # on the local street fabric: candidate positions are the drawn spot plus
     # street nodes within inner_search_radius x the feature's span, tried at

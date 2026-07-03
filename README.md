@@ -187,8 +187,21 @@ barely a city block:
   that anchors the feature to where the drawing put it. A bigger or moved target
   must pay its own way, so useless inflation and wandering lose.
 
+The stage-1 placement proxy also carries a feature term (`inner_proxy_weight`):
+a few sample points per feature are placed with each of the thousands of trial
+transforms, and their snap closeness / node resolvability bias the ranking — so
+feature-friendly placements survive into stage 2 in the first place.
+
 Toggle everything with `inner_features=False` in CONFIG or `--no-inner-features`
 on `gen.py` / `chicago_map.py`.
+
+### Routing robustness
+
+Waypoints that fall in a disconnected pocket of the street graph (a clipped
+component, a park-mesh island) no longer produce straight-line "teleports": the
+router bridges to the reachable node nearest the target (closest approach) and
+continues from wherever the route actually ended, so every produced route is a
+connected walk on real street edges (`python test_routing.py` verifies this).
 
 ## Repository layout
 
