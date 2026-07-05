@@ -74,6 +74,11 @@ Two sub-parts, same theme (don't ask for detail the streets can't draw):
   harmonics `K ≈ blocks/2 ≈ 20` (grid Nyquist), reconstruct, and route to *that*
   smoothed target. Above the grid's Nyquist the router chases detail it renders
   as staircase/comb (aliasing); low-passing removes that source at the input.
+  Geometry-only visual test (no routing): [`docs/fd-lowpass-shapes.png`](fd-lowpass-shapes.png)
+  — organic shapes (Shark/Horse/Knight/Crow/Pawn) reconstruct cleanly at K≈12–20
+  and even shed the SVG's raster jaggies; pointy shapes (star/square/lshape)
+  round their defining corners (star is a plain circle by K=3), confirming the
+  per-shape corner gate below.
   - **Tradeoff:** FD low-pass *rounds sharp corners* and can add Gibbs ringing.
     A star / L-shape lives in its corners → this hurts them; organic shapes
     (shark, crow, horse body) benefit. Must be a per-shape toggle; the
