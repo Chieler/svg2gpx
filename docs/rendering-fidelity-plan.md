@@ -79,6 +79,19 @@ Two sub-parts, same theme (don't ask for detail the streets can't draw):
   and even shed the SVG's raster jaggies; pointy shapes (star/square/lshape)
   round their defining corners (star is a plain circle by K=3), confirming the
   per-shape corner gate below.
+
+  **Routing A/B (same placement, raw target vs FD K=20 target), downtown Chicago
+  — the first rendering change this project measured that improves the picture:**
+  [`docs/fd-route-shark.png`](fd-route-shark.png),
+  [`docs/fd-route-horse.png`](fd-route-horse.png). Combing (route turn beyond the
+  target) collapses — Shark 43.9→24.8, Horse 20.5→4.4 — with fewer nodes, and the
+  Shark loses a spurious comb "box" and its IoU rises 0.32→0.35. The only metric
+  that worsens is Fréchet **vs the raw jagged outline** (Shark 0.068→0.126), which
+  is expected and arguably meaningless: it penalizes the route for not hugging
+  sub-block detail the grid can't render anyway. Net: for organic shapes, route
+  to the FD-K20 target. (This is a *rendering* change grounded in the Nyquist
+  physics, not a selection metric — which is likely why it helps where the void /
+  recognition metric experiments didn't.)
   - **Tradeoff:** FD low-pass *rounds sharp corners* and can add Gibbs ringing.
     A star / L-shape lives in its corners → this hurts them; organic shapes
     (shark, crow, horse body) benefit. Must be a per-shape toggle; the
