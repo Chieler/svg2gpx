@@ -920,6 +920,7 @@ def search_placement(contour, grid, cfg, inners=None):
     # has inner features, their routed fidelity -- and return them ranked.
     center = np.asarray(contour, np.float64).mean(axis=0)
     w_inner = cfg.get("inner_cost_weight", 0.6)
+    w_recog = cfg.get("recognition_weight", 0.6)
     routed, tried, chosen_params = [], 0, []
     for proxy_score, params in results:
         if any(not _placement_far(params, q) for q in chosen_params):
@@ -928,7 +929,18 @@ def search_placement(contour, grid, cfg, inners=None):
         placed = place(contour, *params)
         route, _, _ = build_route(grid, placed, cfg)
         if len(route) >= 3:
+            # Selection cost. placement_cost (perceptual soft-IoU + geometric)
+            # maximizes area overlap, which can prefer a lumpy blob with slightly
+            # more overlap over a placement whose FORM -- the corners, legs, beak
+            # -- actually reads as the shape. Adding the scale/rotation-invariant
+            # turning-function distance (Veltkamp) rewards matching that form; on
+            # structural shapes (a horse's legs) it visibly picks the recognizable
+            # placement the overlap score ranked worse, and it is near-flat on
+            # low-feature blobs so it stays quiet there. w_recog=0 restores the
+            # pure overlap cost.
             cost = placement_cost(route, placed)
+            if w_recog:
+                cost += w_recog * turning_distance(route, placed)
             feats = route_features(grid, inners, params, center, cfg)
             note = ""
             if feats:
@@ -1619,6 +1631,17 @@ CONFIG = dict(
     n_refine=600,             # refinements jittered around the best few
     n_route_eval=6,           # top candidates actually routed + judged by Frechet
     margin=0.02,              # keep the shape this far inside the [0, 1] box
+
+    # Recognition weight (EXPERIMENTAL, default OFF): adds the scale/rotation-
+    # invariant turning-function distance (shape FORM -- corners, protrusions,
+    # legs; Veltkamp SMI'01) to the stage-2 selection cost alongside perceptual
+    # area-overlap. Motivation: overlap can prefer a lumpy blob with marginally
+    # more area over a placement that reads as the shape. It reliably lowers the
+    # turning metric, but in dense-search A/B on real OSM the VISUAL result was
+    # only ambiguously better (a clear win on a thin candidate pool did not
+    # reproduce once the search had a rich pool), so it is off by default rather
+    # than shipped on an unvalidated metric. Set >0 (e.g. 0.6) to experiment.
+    recognition_weight=0.0,
 
     # Keep the shape on walkable land. The route is always on streets, but the
     # target placement could spill over a river/ocean (no nodes there) and distort
