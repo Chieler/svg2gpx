@@ -195,27 +195,6 @@ feature-friendly placements survive into stage 2 in the first place.
 Toggle everything with `inner_features=False` in CONFIG or `--no-inner-features`
 on `gen.py` / `chicago_map.py`.
 
-### Estimating routing quality before routing
-
-A bad placement dooms the route from the start: routing is expensive, so stage 1
-ranks thousands of placements with a cheap geometric proxy (`_score`) and only
-the top few are actually routed. The catch is that every classic proxy term —
-snap distance, coverage, feature reach, grid-angle orientation — is evaluated
-**at the outline points**, while routing walks the streets **between** them. A
-placement whose every vertex snaps perfectly can still have a long edge spanning
-a river, rail cut, highway or superblock with no through-streets, and the route
-detours badly around it.
-
-So the proxy carries a **between-anchor clearance** term (`placement_void_weight`):
-it samples the *midpoints* of a coarsened outline and rewards placements whose
-spans stay near the network. It's near-constant on a void-free grid (can't hurt
-where it doesn't apply) but on real OSM it moves the best-of-top-6 routed cost
-most of the way to the routed optimum — e.g. on the Chicago window, Shark
-0.217 → 0.148 (oracle 0.145), lshape 0.157 → 0.139, with no shape regressing.
-This was chosen by measuring rank-correlation of candidate cheap terms against
-true routed cost; simpler ideas (nearest-node "snap-jump", local street-direction
-availability) flipped sign across shapes and were dropped.
-
 ### Routing robustness
 
 Waypoints that fall in a disconnected pocket of the street graph (a clipped
