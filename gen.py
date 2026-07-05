@@ -514,15 +514,20 @@ def resample(pts, n=None, step=None, closed=True):
     return np.column_stack([x, y])
 
 
-def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0, center=None):
+def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0, flip=False,
+          center=None):
     """Affine-place a polyline about its centroid, then translate.
 
-    Beyond similarity (scale + rot + translate) this adds two shape-fitting DOF:
+    Beyond similarity (scale + rot + translate) this adds three shape-fitting DOF:
       * aspect -- area-preserving anisotropic stretch (diag(a, 1/a)); lets the
                   shape elongate to match Manhattan's ~3:1 blocks, which both fits
                   better and turns shallow-angle edges into aligned ones.
       * shear  -- a small skew, for grids that aren't perfectly orthogonal.
-    aspect=1, shear=0 reduces exactly to the old similarity transform.
+      * flip   -- mirror reflection (across the shape's vertical axis, before
+                  rotation). A shark faces left or right equally well, so this
+                  doubles the orientations available to line the outline up with
+                  the streets. Combined with rotation it reaches any reflection.
+    aspect=1, shear=0, flip=False reduces exactly to the old similarity transform.
 
     `center` overrides the pivot: an inner feature must be placed about the
     OUTER contour's centroid (the same pivot its outline was placed about) so
@@ -533,7 +538,8 @@ def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0, center=None):
     a = np.radians(rot_deg)
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     H = np.array([[1.0, shear], [0.0, 1.0]])
-    Sc = np.array([[scale * aspect, 0.0], [0.0, scale / aspect]])
+    sx = -1.0 if flip else 1.0                      # mirror across the vertical axis
+    Sc = np.array([[scale * aspect * sx, 0.0], [0.0, scale / aspect]])
     M = R @ H @ Sc
     return (pts - c) @ M.T + c + np.array([dx, dy])
 
@@ -630,11 +636,13 @@ def _score(placed, grid, scale, cfg, importance,
 
 
 def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
-    """True if two placements are visibly distinct (params may be 4- or 6-tuples)."""
+    """True if two placements are visibly distinct (params may be 4-, 6- or 7-tuples)."""
     s1, r1, x1, y1 = a[:4]
     s2, r2, x2, y2 = b[:4]
     a1, a2 = (a[4] if len(a) > 4 else 1.0), (b[4] if len(b) > 4 else 1.0)
-    return (abs((r1 - r2 + 180) % 360 - 180) > drot
+    f1, f2 = (a[6] if len(a) > 6 else 0), (b[6] if len(b) > 6 else 0)
+    return (f1 != f2                                   # a mirror image is a distinct placement
+            or abs((r1 - r2 + 180) % 360 - 180) > drot
             or np.hypot(x1 - x2, y1 - y2) > doff
             or abs(s1 - s2) > dscale
             or abs(a1 - a2) > daspect)
@@ -861,6 +869,9 @@ def search_placement(contour, grid, cfg, inners=None):
     lim = 0.5 - cfg["margin"]
     ln_a = np.log(cfg["aspect_max"])
     shm = cfg["shear_max"]
+    refl = cfg.get("reflect", True)          # allow mirror-image placements
+    def rflip():
+        return int(rng.integers(0, 2)) if refl else 0
 
     # A few sample points per inner feature, placed with the outline's pivot,
     # so the stage-1 proxy can score feature seating too (see _score).
@@ -876,29 +887,31 @@ def search_placement(contour, grid, cfg, inners=None):
                                  for s, sz in zip(samples, sizes)])
         feat_share = min(float(sizes.sum()) / max(_arc_len(base), 1e-9), 1.0)
 
-    def trial(scale, rot, dx, dy, aspect, shear):
-        cand = place(base, scale, rot, dx, dy, aspect, shear)
-        fp = (place(probe_feats, scale, rot, dx, dy, aspect, shear,
+    def trial(scale, rot, dx, dy, aspect, shear, flip):
+        cand = place(base, scale, rot, dx, dy, aspect, shear, flip)
+        fp = (place(probe_feats, scale, rot, dx, dy, aspect, shear, flip,
                     center=base_center)
               if probe_feats is not None else None)
         return (_score(cand, grid, scale, cfg, importance, fp, feat_w, feat_share),
-                (scale, rot, dx, dy, aspect, shear))
+                (scale, rot, dx, dy, aspect, shear, flip))
 
     results = [trial(rng.uniform(s_lo, s_hi), rng.uniform(0, 360),
                      rng.uniform(-lim, lim), rng.uniform(-lim, lim),
-                     float(np.exp(rng.uniform(-ln_a, ln_a))), rng.uniform(-shm, shm))
+                     float(np.exp(rng.uniform(-ln_a, ln_a))), rng.uniform(-shm, shm),
+                     rflip())
                for _ in range(cfg["n_random"])]
     results.sort(key=lambda r: r[0], reverse=True)
 
     for _ in range(cfg["n_refine"]):
-        _, (s, r, dx, dy, asp, sh) = results[rng.integers(0, min(8, len(results)))]
+        _, (s, r, dx, dy, asp, sh, fl) = results[rng.integers(0, min(8, len(results)))]
         results.append(trial(
             float(np.clip(s + rng.normal(0, 0.04), s_lo, s_hi)),
             r + rng.normal(0, 6),
             dx + rng.normal(0, 0.03),
             dy + rng.normal(0, 0.03),
             float(np.clip(asp * np.exp(rng.normal(0, 0.05)), 1 / cfg["aspect_max"], cfg["aspect_max"])),
-            float(np.clip(sh + rng.normal(0, 0.03), -shm, shm))))
+            float(np.clip(sh + rng.normal(0, 0.03), -shm, shm)),
+            (1 - fl) if (refl and rng.random() < 0.15) else fl))   # occasionally try the mirror
     results.sort(key=lambda r: r[0], reverse=True)
 
     # Stage 2: route the proxy's best *distinct* placements (dedup first, so we
@@ -927,7 +940,8 @@ def search_placement(contour, grid, cfg, inners=None):
             routed.append(Candidate(cost, placed, route, feats))
             print(f"  placement proxy={proxy_score:.3f} -> cost={cost:.4f} "
                   f"(scale={params[0]:.2f} rot={params[1]:.0f} "
-                  f"aspect={params[4]:.2f} shear={params[5]:+.2f}){note}")
+                  f"aspect={params[4]:.2f} shear={params[5]:+.2f} "
+                  f"flip={int(params[6]) if len(params) > 6 else 0}){note}")
         tried += 1
         if tried >= cfg["n_route_eval"]:
             break
@@ -1598,6 +1612,9 @@ CONFIG = dict(
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
     aspect_max=1.5,           # max area-preserving stretch (1.0 = uniform scale)
     shear_max=0.20,           # max skew, for non-orthogonal grids
+    reflect=True,             # also search mirror-image placements (a shark faces
+                              #   either way): doubles the orientations available to
+                              #   line the outline up with the streets
     n_random=2000,            # coarse random placements
     n_refine=600,             # refinements jittered around the best few
     n_route_eval=6,           # top candidates actually routed + judged by Frechet
