@@ -24,6 +24,7 @@ import numpy as np
 
 import gen
 from gen import (
+    dtw,
     extract_contour,
     format_distance,
     frechet,
@@ -33,6 +34,7 @@ from gen import (
     perceptual_cost,
     route_length_m,
     search_placement,
+    turning_distance,
 )
 from benchmark import SHAPES_DIR, real_grid_cached, synthetic_grid
 
@@ -42,7 +44,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 N_BEST = 3
 
 FIELDS = ["shape", "grid", "candidates", "chosen_cost", "frechet", "hausdorff",
-          "iou", "perceptual", "on_land", "length_m", "nodes", "updated"]
+          "iou", "perceptual", "dtw", "turning", "on_land", "length_m",
+          "nodes", "updated"]
 
 
 def best_for_shape(grid, svg, cfg):
@@ -53,20 +56,21 @@ def best_for_shape(grid, svg, cfg):
     """
     contour = extract_contour(svg, cfg["img_size"])
     eval_cfg = {**cfg, "svg_path": svg, "n_route_eval": N_BEST, "n_options": N_BEST}
-    ranked = search_placement(contour, grid, eval_cfg)   # sorted best-first
+    ranked = search_placement(contour, grid, eval_cfg)   # Candidates, best-first
     candidates = ranked[:N_BEST]
-    costs = [float(c) for c, _, _ in candidates]
+    costs = [float(c.cost) for c in candidates]
     return costs, candidates[0]
 
 
 def score_row(name, grid_kind, costs, best, grid):
     """Build the result.csv row for the chosen best route."""
-    cost, placed, route = best
+    cost, placed, route = best.cost, best.placed, best.route
     if len(route) < 2:
         return {"shape": name, "grid": grid_kind,
                 "candidates": " ".join(f"{c:.4f}" for c in costs),
                 "chosen_cost": cost, "frechet": float("nan"),
                 "hausdorff": float("nan"), "iou": 0.0, "perceptual": float("nan"),
+                "dtw": float("nan"), "turning": float("nan"),
                 "on_land": 0.0, "length_m": 0.0, "nodes": len(route),
                 "updated": _now()}
     return {
@@ -78,6 +82,8 @@ def score_row(name, grid_kind, costs, best, grid):
         "hausdorff": round(hausdorff(route, placed), 6),
         "iou": round(iou(route, placed, 0.01), 4),
         "perceptual": round(perceptual_cost(route, placed), 6),
+        "dtw": round(dtw(route, placed), 6),
+        "turning": round(turning_distance(route, placed), 6),
         "on_land": round(land_fraction(placed, grid) * 100.0, 1),
         "length_m": round(route_length_m(route, grid), 1),
         "nodes": len(route),

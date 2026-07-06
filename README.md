@@ -29,13 +29,20 @@ Dijkstra hop is short and has little room to stray from the outline.
 
 ### Fidelity metrics
 
-The route is scored against the target outline with complementary measures (all in `gen.py`):
+The route is scored against the target outline with complementary measures (all in `gen.py`),
+each catching a failure the others miss:
 
-- **Fréchet** — respects order; punishes out-of-sequence detours that pointwise metrics miss.
-- **Hausdorff** — worst-case point-to-curve distance.
+- **Fréchet** — order-aware *worst-case* leash; punishes out-of-sequence detours that pointwise metrics miss.
+- **Hausdorff** — worst-case point-to-curve distance (single largest excursion).
 - **IoU** — area overlap of the two thickened outlines.
 - **Perceptual cost** — blur-tolerant render-and-compare (`1 − soft-IoU`); judges the overall gestalt the way the eye does.
+- **DTW** — cyclic Dynamic Time Warping: like Fréchet but *sums* the leash over the best alignment instead of taking its max, so it rewards hugging the outline everywhere rather than only at the worst point. Tries cyclic start offsets and both winding directions, since the loops have no canonical start.
+- **Turning distance** — compares the curves' *turning-angle vs. arc-length* signatures: a translation/rotation/scale-invariant measure of **form** (corners, protrusions) that is sharp about real features yet ignores staircase jitter.
 - **On-land %** and **distance** — sanity/runnability checks.
+
+Reading them together tells you *how* a result is good or bad: Fréchet/DTW for path order
+(worst vs. average), Hausdorff for a single bad excursion, IoU for overall area, and turning
+distance for whether the corners and protrusions land in the right places.
 
 ---
 
@@ -59,11 +66,28 @@ sudo apt-get install -y libegl1 libgl1
 ### Generate a route
 
 ```bash
-python gen.py
+python gen.py                                        # CONFIG defaults (Manhattan, star)
+python gen.py --svg shapes/Crow.svg --granularity 0.8
+python gen.py --lat 41.9285 --lng -87.7075 --save route.png --no-show
 ```
 
-Tune everything from the `CONFIG` dict in `gen.py` — location, search budget,
-granularity, and which shape (`svg_path`) to map.
+Every common knob is a CLI flag (`--svg`, `--lat/--lng/--radius`, `--granularity`,
+`--graphml`, `--seed`, `--save`, `--no-show`); everything else is tuned from the
+`CONFIG` dict in `gen.py`. `--graphml` loads a saved `ox.save_graphml` network
+instead of fetching from the Overpass API, for offline / reproducible runs.
+
+### Trace the shapes on the real Chicago street map
+
+[`chicago_map.py`](chicago_map.py) runs every bundled shape on the **real Chicago
+street network** (an OpenStreetMap citywide snapshot, downloaded once into `data/`)
+and renders each route on the actual OSMnx map, plus a gallery image, per-shape
+GeoJSON (WGS84) and a metrics CSV in `chicago_maps/`.
+
+```bash
+python chicago_map.py                    # all shapes, Logan Square window
+python chicago_map.py --shape star       # one shape
+python chicago_map.py --live             # fetch fresh OSM data instead
+```
 
 ### Benchmark fidelity across shapes
 
@@ -113,6 +137,71 @@ Trigger it from the **Actions** tab (`workflow_dispatch`) with inputs:
 Sample SVGs live in [`shapes/`](shapes): `square`, `circle`, `lshape`, `star`.
 Drop any `<polygon>` / `<path>` SVG in there and the benchmark and Action pick it up
 automatically — no code changes needed.
+
+### Inner features
+
+Shapes are more than their outer silhouette. `extract_shape()` in `gen.py` also
+finds the SVG's **inner features**, classified from the raster's ink/paper contour
+tree, whether or not they touch the outer contour:
+
+- **holes** — a donut's hole, a shark's eye (closed loops);
+- **disconnected inner elements** — a smiley's eyes and mouth, drawn entirely
+  separate from the outer ring (closed loops);
+- **interior detail strokes** in line art — a wing line, a horse's mane — found as
+  the arcs where an interior region's boundary deviates from the outline it shadows
+  (open paths, runnable as out-and-back spurs).
+
+`extract_contour()` still returns just the outer outline, so existing callers are
+unchanged. Visual check: `python preview_features.py` (writes
+`inner_features_preview.png`); correctness checks: `python test_inner_features.py`.
+
+The features are then **placed and routed** with the outer contour: every feature
+gets the exact affine chosen for the outline (scale, rotation, aspect, shear —
+about the same pivot), closed features route as their own loops and open ones as
+out-and-back spurs (`build_feature_route`). And because features are only useful
+when the contour is good, the placement search's second stage — the top
+`n_route_eval` routed candidates — folds each candidate's **feature fidelity into
+its cost** (`feature_cost`): the per-feature routed deviation (1.0 for a feature
+that is off-grid or below street resolution), size-weighted and bounded by the
+features' share of total drawn length, scaled by `inner_cost_weight`. A placement
+whose contour seats nicely but strands the eye now ranks below one that draws both.
+
+Small features get two extra rescues, since an eye drawn at 2% of the shape spans
+barely a city block:
+
+- **feature-scaled smoothing** — cleanup's corner-cut slack is sized for the outer
+  shape and would legally shortcut a small eye into a triangle; feature routing
+  raises the effective granularity until the slack is a small fraction of the
+  feature's own span;
+- **street-tailored refinement** (`refine_feature`, `inner_refine`) — each feature
+  is re-seated on the street fabric around its drawn spot, mirroring the outer
+  two-stage search in miniature: candidate positions are the drawn centroid plus
+  every street node within `inner_search_radius`× the feature's span, tried at
+  small rotations (±`inner_rot_deg`) and a ladder of scales including a rescue
+  upscale for features narrower than `inner_min_span_blocks` street edges (capped
+  `inner_max_inflate`×). A cheap street-fit proxy — snap closeness, coverage, and
+  how many *distinct* nodes the outline resolves to (tiny features die by
+  collapsing onto one node) — ranks the variants; the best `inner_route_eval` are
+  actually routed (the drawn identity and the best rescue variant are always
+  among them), and the winner minimizes routed deviation plus a drift penalty
+  that anchors the feature to where the drawing put it. A bigger or moved target
+  must pay its own way, so useless inflation and wandering lose.
+
+The stage-1 placement proxy also carries a feature term (`inner_proxy_weight`):
+a few sample points per feature are placed with each of the thousands of trial
+transforms, and their snap closeness / node resolvability bias the ranking — so
+feature-friendly placements survive into stage 2 in the first place.
+
+Toggle everything with `inner_features=False` in CONFIG or `--no-inner-features`
+on `gen.py` / `chicago_map.py`.
+
+### Routing robustness
+
+Waypoints that fall in a disconnected pocket of the street graph (a clipped
+component, a park-mesh island) no longer produce straight-line "teleports": the
+router bridges to the reachable node nearest the target (closest approach) and
+continues from wherever the route actually ended, so every produced route is a
+connected walk on real street edges (`python test_routing.py` verifies this).
 
 ## Repository layout
 

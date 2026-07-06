@@ -38,7 +38,7 @@ from scipy.spatial import cKDTree
 import gen
 from gen import (
     Grid,
-    build_route,
+    dtw,
     extract_contour,
     format_distance,
     frechet,
@@ -48,6 +48,7 @@ from gen import (
     perceptual_cost,
     route_length_m,
     search_placement,
+    turning_distance,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -150,11 +151,13 @@ def run_case(grid, case, cfg):
     ranked = search_placement(contour, grid, {**cfg, "svg_path": case["svg"]})
     t_search = time.perf_counter() - t1
 
-    cost, placed, route = ranked[0]
+    best = ranked[0]
+    cost, placed, route = best.cost, best.placed, best.route
     if len(route) < 2:
         return {"name": case["name"], "nodes": len(route), "cost": cost,
                 "frechet": float("nan"), "hausdorff": float("nan"), "iou": 0.0,
-                "perceptual": float("nan"), "on_land": 0.0, "length_m": 0.0,
+                "perceptual": float("nan"), "dtw": float("nan"),
+                "turning": float("nan"), "on_land": 0.0, "length_m": 0.0,
                 "t_contour": t_contour, "t_search": t_search}
 
     return {
@@ -165,6 +168,8 @@ def run_case(grid, case, cfg):
         "hausdorff": hausdorff(route, placed),
         "iou": iou(route, placed, 0.01),
         "perceptual": perceptual_cost(route, placed),
+        "dtw": dtw(route, placed),
+        "turning": turning_distance(route, placed),
         "on_land": land_fraction(placed, grid) * 100.0,
         "length_m": route_length_m(route, grid),
         "t_contour": t_contour,
@@ -181,6 +186,8 @@ COLUMNS = [
     ("hausdorff", "Hausdf", 8, lambda v: f"{v:>8.4f}"),
     ("iou", "IoU", 6, lambda v: f"{v:>6.3f}"),
     ("perceptual", "percept", 8, lambda v: f"{v:>8.4f}"),
+    ("dtw", "DTW", 8, lambda v: f"{v:>8.4f}"),
+    ("turning", "turning", 8, lambda v: f"{v:>8.4f}"),
     ("cost", "cost", 8, lambda v: f"{v:>8.4f}"),
     ("on_land", "land%", 6, lambda v: f"{v:>6.0f}"),
     ("length_m", "dist", 16, lambda v: f"{v:>16}"),
@@ -216,12 +223,14 @@ def _print_summary(results):
     print(f"mean over {len(ok)} cases:  "
           f"Frechet={mean('frechet'):.4f}  Hausdorff={mean('hausdorff'):.4f}  "
           f"IoU={mean('iou'):.3f}  perceptual={mean('perceptual'):.4f}  "
+          f"DTW={mean('dtw'):.4f}  turning={mean('turning'):.4f}  "
           f"t_route={mean('t_search'):.2f}s")
 
 
 def write_csv(results, path):
     fields = ["name", "nodes", "frechet", "hausdorff", "iou", "perceptual",
-              "cost", "on_land", "length_m", "t_contour", "t_search"]
+              "dtw", "turning", "cost", "on_land", "length_m",
+              "t_contour", "t_search"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
