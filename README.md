@@ -217,9 +217,47 @@ requirements-osm.txt         # extras for real OSM + plotting
 ```
 
 
-##Future Improvements:
-Post-processing:
-for none important features(main-body): smooth out/remove nooks/remove protrusions
-for important features that are clear appendages: affine/distort to fit street better visually
-Potential idea: iterative post-processing, where once a big change has been made we restart from the start so as to get the right state information
-We can tell appendages apart from main body with skeletonization (below a certain ratio comapared to main skeleton)
+## Future Improvements:
+
+Idea A: Turning-Penalized "Snake Mode" (State-Space Dijkstra)
+Value for gen.py: Extremely High. * The Problem in gen.py: Currently, route_pair runs a standard node-based Dijkstra loop where edge costs are computed as edge_length + weight * distance_to_outline(neighbor). Because the state space is tracked strictly by the current node u, the graph expansion is blind to momentum. If a tiny zig-zag (a comb tooth) shaves off a fraction of a geometric unit of deviation, Dijkstra will eagerly take it because it cannot factor in the fact that it is executing two rapid $90^\circ$ turns.Implementation 
+Shift: Rewrite route_pair to track the state space as a tuple of (current_node, incoming_edge_id) or (current_node, parent_node). This breaks the strict Bellman criteria constraints by preserving directional history, allowing you to add a massive penalty to the cost accumulator if the angle change between the incoming edge and candidate outgoing edge represents an immediate lateral alternation.
+turn penalty should not be absolute. Instead of a raw penalty for any turn, it should be a relative angular deviation penalty: penalize the difference between the change in the street angle and the change in the contour angle. If the contour turns $90^\circ$ and the street turns $90^\circ$, the penalty is $0$. If the contour goes straight and the street turns $90^\circ$, apply the full penalty.
+
+Idea B: Morphological Skeletonization & Component-Based Warping
+Value for gen.py: Medium-High (Great for Protrusions).The Problem in gen.py: search_placement applies an excellent global affine transform matrix (handling scale, rotation, aspect ratio, shear, and flipping) to fit the whole shape onto the city grid. However, when a shape has narrow, rigid appendages running diagonally across a grid layout, a global transform cannot satisfy both the main mass and the limb simultaneously. This causes the dense waypoints along that limb to map awkwardly, forcing a combed path.Implementation
+Shift: In extract_shape, add a morphological skeletonization pass on the binary ink mask binary before tracing vertices. Segment the shape into a "core body" and "appendage chains." Instead of a uniform place() function, you can allow appendages to dynamically bend or locally align their internal vectors to mirror the dominant local street orientation (grid.grid_angle).
+   i.e. affine towards secondary/dominant street angle / affine on the fly
+Idea C: Dedicated Post-Processing Combing Filter
+Value for gen.py: High (Low-Risk, Immediate Payoff).The Problem in gen.py: gen.py a
+dissolve_oscillations(). This filter ignores spatial distance to the shape temporarily and analyzes the discrete turn signature of the route sequence (e.g., looking for a pattern of [+90°, -90°, +90°, -90°] within 4–6 nodes). When detected, it forces a bypass to collapse the tooth into a monotone staircase line, verifying afterwards that it doesn't violate a hard threshold.
+
+New Structural Changes for gen.py (Unexplored So Far)
+1: Soft Viterbi/HMM Trellis Routing (Replacing Strict Node-Chaining)The Vulnerability: route_contour currently marches sequentially through a single array of snapped node anchors (waypoints). If snap_waypoints selects even one bad node due to local grid anomalies, the path is structurally compromised because Dijkstra must visit that exact node before moving to the next.
+The Change: Eliminate strict point-snapping entirely. For each waypoint on the densified contour, use grid.tree.query_ball_point to gather a set of candidate nodes within a small radius (e.g., 3 nearest intersections). Build an HMM/Viterbi trellis across these sets. The transition cost is the true shortest-path distance between nodes in layer $i-1$ and layer $i$, while the emission cost is the node's proximity to the contour.Why it helps: This completely decouples the routing path from arbitrary, local snapping errors. The network finds the globally smoothest corridor through the street graph that matches the contour sequence, naturally absorbing or discarding awkward side-streets.
+
+
+Change 2: Precomputed Static Edge-Cost MapsThe Vulnerability: In route_pair, the inner Dijkstra loop calls a closure function returned by _polyline_dist_fn(seg) for every neighbor expanded. This function dynamically calculates the minimum distance from a point coordinate to a line segment using vector operations (np.einsum, np.clip). Calling this on every neighbor expansion across long paths is highly CPU-bound and limits performance.The Change: Move from dynamic segment calculation to a static graph decoration phase. Once search_placement settles on a final placement vector, execute a single vectorized calculation across all nodes/edges in the bounding box relative to the target polyline. Cache a scalar contour_dist directly onto the grid.graph adjacency entries.Why it helps: Reduces the inner loop of Dijkstra to a trivial $O(1)$ lookup (cost = edge_length + weight * nbr_static_dist). This increases routing execution speeds, allowing you to scale up parameters like n_route_eval or run much denser grids without bottlenecking performance.
+Change 3: Directional Velocity Pruning (Enforcing Monotonicity)The Vulnerability: Combing occurs because a route moves backwards or sideways relative to the overall progression of the shape to satisfy a micro-distance advantage.The Change: Compute a forward progression vector $\vec{V}_{target}$ for the current segment of the contour. When expanding neighbors in route_pair, calculate the directional vector of the candidate street edge $\vec{V}_{edge} = \text{neighbor} - \text{current}$. Compute the dot product:$$\vec{V}_{target} \cdot \vec{V}_{edge}$$If the dot product is negative (meaning the street edge forces the runner to travel backwards relative to the shape's vector), apply a massive multiplier penalty to that edge, or prune it from expansion completely.
+Why it helps: This mathematically guarantees monotonicity along a shape's face. It permits the graph to step outward and forward (staircasing), but bans it from darting inward and backward (combing), blocking high-frequency oscillations before they can form.
+Change 4: Graph Topology Coarsening (Virtual Edge Bundling)The Vulnerability: Because _densify_edge breaks long street links into chains of small sub-blocks to catch fine shape adjustments, it inflates the graph's node depth. This massive node count allows Dijkstra to make micro-jogs down side alleys mid-block.The Change: Keep a dual-graph representation. Perform routing on the simplified structural intersection graph (where edges only exist between actual road junctions) using an edge-integral cost function, rather than routing on micro-segmented nodes.Why it helps: If the router can only make decisions at true physical street intersections, it structurally cannot create micro-comb teeth in the middle of a city block, forcing clean, uniform lines from corner to corner.
+
+
+
+
+1. Look-Ahead Junction Deceleration (Variable Momentum Weight)
+
+Instead of a static TURN_WEIGHT throughout the entire route, you should scale the momentum penalty based on the local curvature of the target SVG.
+
+    Compute the turning angle of the SVG template at every waypoint.
+
+    Where the SVG is a long straight line (the shark's belly), crank the momentum weight up to maximum to completely suppress combing.
+
+    When the SVG approaches a sharp corner or an appendage junction (the base of a fin), dynamically drop the momentum weight to near zero.
+
+    This signals to the Dijkstra router: "An intentional structural corner is coming up; you are allowed to slow down and make a sharp, pivoting turn here without penalty."
+
+
+2. Anchor-Free "Jump Fields" at Junctions
+
+Instead of forcing the path to route sequentially through every single waypoint at a junction, adapt route_contour to allow multipath look-aheads near complex transitions. If the router detects that stepping into a narrow street pocket creates an unrunnable nook, it should have the structural freedom to "leap" across the junction base to a node on the appendage's main stem, trading a minor piece of interior area fidelity for massive topological stability.
