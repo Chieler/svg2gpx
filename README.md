@@ -215,3 +215,11 @@ requirements.txt             # core dependencies
 requirements-osm.txt         # extras for real OSM + plotting
 .github/workflows/           # Best Route GitHub Action
 ```
+
+
+##Future Improvements:
+Post-processing:
+for none important features(main-body): smooth out/remove nooks/remove protrusions
+for important features that are clear appendages: affine/distort to fit street better visually
+Potential idea: iterative post-processing, where once a big change has been made we restart from the start so as to get the right state information
+We can tell appendages apart from main body with skeletonization (below a certain ratio comapared to main skeleton)
