@@ -2209,16 +2209,16 @@ CONFIG = dict(
     trellis_k=3,
     trellis_emit_weight=6.0,
 
-    # Fourier-descriptor low-pass of the TARGET (maybe_lowpass_contour). Keeps
-    # only the first fd_harmonics harmonics of the closed outline, so the router
-    # traces a shape the street grid can render instead of chasing sub-block
-    # detail it can only staircase/comb. This is an INPUT-side change (it does not
-    # touch any cost the search optimizes), which is why -- unlike the router-side
-    # turn_weight / trellis knobs -- it is a net win here and ships default-ON,
-    # gated so it only fires on shapes with detail worth removing that it actually
-    # smooths (not sharp shapes it would ring, nor already-smooth ones it can't
-    # help). See docs/routing-fidelity-plan.md and docs/rendering-fidelity-plan.md.
-    fd_lowpass=True,
+    # Fourier-descriptor low-pass of the TARGET (maybe_lowpass_contour, default
+    # OFF). Keeps only the first fd_harmonics harmonics of the closed outline, so
+    # the router traces a shape the grid can render instead of chasing sub-block
+    # detail it can only staircase/comb. Triple-gated (detail present, low-pass
+    # smooths it, silhouette reshaped -- the elongation gate). It moves the
+    # synthetic metrics up and is a no-op on shapes it would hurt, but the final
+    # eyeball verdict on real-Chicago renders still went against it, and the
+    # human look is this project's final metric (see docs/routing-fidelity-plan.md)
+    # -- so it ships OFF, an opt-in knob like turn_weight / trellis.
+    fd_lowpass=False,
     fd_harmonics=20,              # grid Nyquist ~ blocks-per-shape / 2
     fd_detail_turns=3.0,          # only shapes whose turning exceeds this x 2*pi
     fd_min_turn_drop=0.15,        # that the low-pass smooths by >= this fraction

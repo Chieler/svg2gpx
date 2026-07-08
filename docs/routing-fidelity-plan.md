@@ -7,12 +7,12 @@ which attacks the same artifact from the *input* side (Fourier low-pass matches
 the target's detail to the grid's Nyquist). The two are complementary: low-pass
 lowers the *demand* for combing, the changes here lower the *supply*.
 **Status: Phase 0–4 implemented. Grid-independent wins (default-ON): Phase 0
-(the `excess` metric) and the Phase-3 Hausdorff fix. Situational knobs: the
-Phase-2 turn penalty and Phase-3 trellis (default-OFF), and the Phase-4 Fourier
-low-pass (default-ON, now with an **elongation-aware gate** — a real-grid
-per-family check showed it was rounding compact shapes into blobs, so it now fires
-only on long-edged shapes and is a no-op on compact ones, byte-identical to the
-sharp engine there).**
+(the `excess` metric) and the Phase-3 Hausdorff fix. Situational knobs, all
+default-OFF: the Phase-2 turn penalty, the Phase-3 trellis, and the Phase-4
+Fourier low-pass (even with the elongation-aware gate, the final eyeball verdict
+on real-Chicago renders went against it — and the human look is this plan's own
+final metric — so it ships OFF, opt-in). Net: the default engine is main's
+engine; this branch adds trustworthy metrics and documented, tested knobs.**
 
 ## Diagnosis (measured on the synthetic 50×50 lattice, all bundled shapes)
 
@@ -291,6 +291,15 @@ built on. Default-ON (`fd_lowpass=True`), gated; set `fd_lowpass=False` to disab
 > gate threshold is calibrated on the bundled shapes (n≈6, noisy real-grid ground
 > truth); Horse remains the one applied shape whose real-grid benefit is
 > placement-noisy rather than proven.
+
+> **Final verdict: `fd_lowpass` ships default-OFF.** Even gated, the side-by-side
+> Chicago renders read *worse* to the human eye across the board. Per this plan's
+> own rule — never trust a cost the search optimizes; the rendered look is the
+> final metric — the eyeball outranks the benchmark, so the low-pass joins
+> `turn_weight` and `trellis` as an opt-in knob. The deeper lesson feeding the
+> next iteration: the contour is a *template*, not a constraint — adherence
+> metrics against it (IoU/Frechet) were never measuring "reads as the animal,"
+> which is why five engine experiments in a row moved them without a visual win.
 
 **Re-test of the router knobs on the low-passed target (measured).** The
 hypothesis was that `turn_weight` / `trellis` were penalized for corner-rounding
