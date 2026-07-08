@@ -129,8 +129,31 @@ def main():
 
     dissolve_checks()
     momentum_checks()
+    trellis_checks()
 
     print("\nall routing checks passed")
+
+
+def trellis_checks():
+    """The candidate-set trellis router yields a closed connected walk, and with
+    trellis_k=1 (a single candidate per anchor) it degenerates to single-snap."""
+    cfg = dict(gen.CONFIG)
+    cfg.update(grid_size=30, grid_diagonals=True, n_random=300, n_refine=100,
+               n_route_eval=2, inner_features=False, trellis=True)
+    lattice = synthetic_grid(cfg)
+    spec = gen.extract_shape("shapes/star.svg", 512)
+    cand = search_placement(spec.outer, lattice, cfg)[0]
+    check(len(cand.route) > 10 and is_connected_walk(cand.route, lattice.graph)
+          and cand.route[0] == cand.route[-1],
+          "trellis routing: closed connected walk on the lattice")
+
+    # trellis_k=1 -> one candidate (the nearest node) per anchor, so the trellis
+    # has no choice and must reproduce a connected closed walk just like single-snap.
+    dense, anchor_idx = gen._densify_and_anchor(cand.placed, lattice, cfg, closed=True)
+    r1 = gen.route_contour_trellis(lattice, dense, anchor_idx,
+                                   cfg["deviation_weight"], {**cfg, "trellis_k": 1})
+    check(len(r1) > 10 and is_connected_walk(r1, lattice.graph) and r1[0] == r1[-1],
+          "trellis_k=1 degenerates to a valid single-candidate walk")
 
 
 def momentum_checks():

@@ -651,12 +651,18 @@ def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
 
 def build_route(grid, placed, cfg):
     """Run the full snap -> route -> cleanup pipeline for one placement."""
-    dense, waypoints, wp_idx = snap_waypoints(placed, grid, cfg)
+    dense, anchor_idx = _densify_and_anchor(placed, grid, cfg, closed=True)
+    waypoints, wp_idx = _snap_anchors(grid, dense, anchor_idx)
     if len(waypoints) < 3:
         return [], dense, waypoints
     w = cfg["deviation_weight"]
     tw = cfg.get("turn_weight", 0.0)
-    route = route_contour(grid, dense, waypoints, wp_idx, w, turn_weight=tw)
+    if cfg.get("trellis", False) and len(anchor_idx) >= 3:
+        route = route_contour_trellis(grid, dense, anchor_idx, w, cfg, closed=True)
+        if len(route) < 3:                              # trellis gave up: fall back
+            route = route_contour(grid, dense, waypoints, wp_idx, w, turn_weight=tw)
+    else:
+        route = route_contour(grid, dense, waypoints, wp_idx, w, turn_weight=tw)
     route = cleanup(grid, route, dense, wp_idx, w, cfg)
     return route, dense, waypoints
 
@@ -924,12 +930,13 @@ def search_placement(contour, grid, cfg, inners=None):
     center = np.asarray(contour, np.float64).mean(axis=0)
     w_inner = cfg.get("inner_cost_weight", 0.6)
     w_recog = cfg.get("recognition_weight", 0.6)
-    # The turn penalty is a *rendering* improvement, not a selection signal:
-    # letting it change which placement wins reintroduces the very artifact the
-    # plan warns about (a higher-overlap but more-combed placement outranking a
-    # clean one). So rank placements on the turn_weight=0 route (unchanged,
-    # validated behaviour) and re-route the winners with the penalty afterwards.
-    sel_cfg = {**cfg, "turn_weight": 0.0}
+    # The turn penalty and the trellis are *rendering* improvements, not
+    # selection signals: letting them change which placement wins reintroduces
+    # the artifact the plan warns about (a higher-overlap but more-combed
+    # placement outranking a clean one), and the trellis is too slow to run on
+    # every candidate. So rank placements on the plain turn_weight=0 single-snap
+    # route (unchanged, validated behaviour) and re-render the winners afterwards.
+    sel_cfg = {**cfg, "turn_weight": 0.0, "trellis": False}
     routed, tried, chosen_params = [], 0, []
     for proxy_score, params in results:
         if any(not _placement_far(params, q) for q in chosen_params):
@@ -974,10 +981,10 @@ def search_placement(contour, grid, cfg, inners=None):
                           route_features(grid, inners, params, center, cfg))]
 
     routed.sort(key=lambda c: c.cost)
-    # Re-route the ranked winners with the turn penalty (selection already fixed
-    # above at turn_weight=0). The cost keeps its validated basis; only the route
-    # that gets rendered/measured gains the combing suppression.
-    if cfg.get("turn_weight", 0.0) > 0.0:
+    # Re-render the ranked winners with the turn penalty and/or trellis (selection
+    # was fixed above on the plain route). The cost keeps its validated basis;
+    # only the route that gets rendered/measured gains the improvement.
+    if cfg.get("turn_weight", 0.0) > 0.0 or cfg.get("trellis", False):
         for cand in routed:
             cand.route = build_route(grid, cand.placed, cfg)[0]
     return routed
@@ -1006,6 +1013,18 @@ def snap_waypoints(placed, grid, cfg, closed=True):
     Returns the dense outline, the snapped node anchors, and each anchor's index
     within `dense` (so the router can slice the local arc between anchors).
     """
+    dense, anchor_idx = _densify_and_anchor(placed, grid, cfg, closed)
+    waypoints, wp_dense_idx = _snap_anchors(grid, dense, anchor_idx)
+    return dense, waypoints, wp_dense_idx
+
+
+def _densify_and_anchor(placed, grid, cfg, closed=True):
+    """Densify the placed outline and select the anchor indices along it.
+
+    Split out of snap_waypoints so both the single-snap router and the trellis
+    router work from the exact same anchor set (only the trellis then keeps a
+    *set* of candidate nodes per anchor instead of snapping to one).
+    """
     g = cfg["granularity"]
     dense = resample(placed, step=grid.avg_edge * 0.4, closed=closed)
     importance = waypoint_importance(dense)
@@ -1024,16 +1043,19 @@ def snap_waypoints(placed, grid, cfg, closed=True):
             acc = 0.0
     if anchor_idx[-1] != len(dense) - 1:
         anchor_idx.append(len(dense) - 1)
+    return dense, anchor_idx
 
-    _, idx = grid.tree.query(pts[anchor_idx])
-    waypoints, wp_dense_idx = [], []
-    last = -1
+
+def _snap_anchors(grid, dense, anchor_idx):
+    """Snap each anchor to its single nearest node (dedup consecutive repeats)."""
+    _, idx = grid.tree.query(np.asarray(dense)[anchor_idx])
+    waypoints, wp_dense_idx, last = [], [], -1
     for a, k in zip(anchor_idx, idx):
         if k != last:
             waypoints.append(grid.node_keys[int(k)])
             wp_dense_idx.append(a)
             last = int(k)
-    return dense, waypoints, wp_dense_idx
+    return waypoints, wp_dense_idx
 
 
 def _polyline_dist_fn(seg):
@@ -1285,6 +1307,162 @@ def route_contour(grid, dense, waypoints, wp_idx, weight, turn_weight=0.0):
     return route
 
 
+def _trellis_dp(cand, emit, T, w_emit, closed):
+    """Exact DP over the candidate trellis.
+
+    States are (layer, candidate); the cost is additive and first-order --
+    Total = sum_i w_emit * emit_i(c_i) + sum_i T_i(c_{i-1}, c_i) -- so Bellman's
+    principle holds and this forward pass is globally optimal over the lattice.
+    Returns the chosen candidate index per layer, or None if no path exists.
+    A closed loop has no canonical start, so we solve the chain once per layer-0
+    candidate (fixing the seam) and keep the best cycle; the candidate sets are
+    small (K ~ 3), so this stays cheap.
+    """
+    M = len(cand)
+    if M < 2 or any(len(c) == 0 for c in cand):
+        return None
+
+    def forward(prev):
+        back = [None] * M
+        for j in range(1, M):
+            costs = prev[:, None] + T[j - 1]              # (K_{j-1}, K_j)
+            bk = np.argmin(costs, axis=0)
+            prev = costs[bk, np.arange(costs.shape[1])] + w_emit * emit[j]
+            back[j] = bk
+        return prev, back
+
+    def rebuild(back, end):
+        seq = [0] * M
+        seq[M - 1] = int(end)
+        for j in range(M - 1, 0, -1):
+            seq[j - 1] = int(back[j][seq[j]])
+        return seq
+
+    if not closed:
+        prev, back = forward(w_emit * emit[0].astype(float))
+        end = int(np.argmin(prev))
+        return rebuild(back, end) if np.isfinite(prev[end]) else None
+
+    best_total, best_seq = np.inf, None
+    for s0 in range(len(cand[0])):
+        start = np.full(len(cand[0]), np.inf)
+        start[s0] = w_emit * float(emit[0][s0])
+        prev, back = forward(start)
+        close = prev + T[M - 1][:, s0]                    # wrap: layer M-1 -> layer 0
+        end = int(np.argmin(close))
+        if float(close[end]) < best_total:
+            best_total = float(close[end])
+            seq = rebuild(back, end)
+            seq[0] = s0
+            best_seq = seq
+    return best_seq if np.isfinite(best_total) else None
+
+
+def route_contour_trellis(grid, dense, anchor_idx, weight, cfg, closed=True):
+    """Route the contour as a Viterbi trellis over candidate node sets.
+
+    Instead of snapping each anchor to its single nearest node and forcing the
+    path through it (one bad snap -> one big excursion), each anchor gets a set
+    of candidate nodes (the K nearest) and an exact dynamic program picks the
+    globally cheapest *sequence*: transition cost is the contour-biased
+    route_pair length between consecutive choices, emission cost is each node's
+    distance to its anchor point (so the corridor stays on the outline rather
+    than shrinking inward to shorten legs). The objective is additive and
+    first-order over the layers, so the DP is optimal by Bellman -- and the
+    single-snap path is itself one lattice path, so the trellis is never worse on
+    that objective. It naturally "jumps" a bad side-pocket by preferring a
+    neighbouring candidate, which subsumes the anchor-free jump-field idea.
+
+    turn_weight (Phase 2) threads into each leg's route_pair, so the momentum
+    penalty shapes the legs while the trellis chooses the anchors.
+    """
+    tw = cfg.get("turn_weight", 0.0)
+    K = max(1, int(cfg.get("trellis_k", 3)))
+    w_emit = float(cfg.get("trellis_emit_weight", 6.0))
+    pts = np.asarray(dense, dtype=np.float64)
+    anchor_idx = list(anchor_idx)
+    # A closed dense repeats its first point at the end; drop the duplicate anchor
+    # so layer 0 and the wrap leg aren't the same location.
+    if (closed and len(anchor_idx) >= 2
+            and np.allclose(pts[anchor_idx[0]], pts[anchor_idx[-1]])):
+        anchor_idx = anchor_idx[:-1]
+    M = len(anchor_idx)
+    if M < 3:
+        return []
+
+    cand, emit = [], []                       # per layer: node keys + dist to anchor
+    for a in anchor_idx:
+        d, ii = grid.tree.query(pts[a], k=K)
+        d, ii = np.atleast_1d(d), np.atleast_1d(ii)
+        seen, nodes, dists = set(), [], []
+        for dv, kk in zip(d, ii):
+            kk = int(kk)
+            if kk not in seen:
+                seen.add(kk)
+                nodes.append(grid.node_keys[kk])
+                dists.append(float(dv))
+        cand.append(nodes)
+        emit.append(np.asarray(dists))
+
+    def leg_seg(j, j2):
+        s = (dense[anchor_idx[j]:anchor_idx[j2] + 1] if j2 > j
+             else np.vstack([dense[anchor_idx[j]:], dense[:anchor_idx[j2] + 1]]))
+        return s if len(s) >= 2 else None
+
+    def leg_path(na, nb, seg):
+        s = seg if seg is not None else np.array([na, nb])
+        return route_pair(grid.graph, na, nb, s, weight, best_effort=True,
+                          turn_weight=tw, avg_edge=grid.avg_edge)
+
+    nlegs = M if closed else M - 1
+    T = []                                    # T[j][a][b] = route_pair leg cost
+    for j in range(nlegs):
+        j2 = (j + 1) % M
+        seg = leg_seg(j, j2)
+        dist_to = _polyline_dist_fn(seg) if seg is not None else None
+        A, B = cand[j], cand[j2]
+        Tj = np.full((len(A), len(B)), np.inf)
+        for ai, na in enumerate(A):
+            for bi, nb in enumerate(B):
+                if na == nb:
+                    Tj[ai, bi] = 0.0
+                    continue
+                path = leg_path(na, nb, seg)
+                if not path:
+                    continue
+                p = np.asarray(path, dtype=np.float64)
+                length = float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+                # route_pair's own objective: length + weight * summed deviation of
+                # the leg from the contour, so the trellis prefers endpoint pairs
+                # whose connecting path *hugs* the outline, not just short ones --
+                # this is what discourages an excursion, not merely a long leg.
+                dev = (sum(dist_to(n) for n in path[1:]) if dist_to is not None
+                       else 0.0)
+                cost = length + weight * dev
+                if path[-1] != nb:            # bridged across a gap: discourage
+                    cost += 1e6
+                Tj[ai, bi] = cost
+        T.append(Tj)
+
+    seq = _trellis_dp(cand, emit, T, w_emit, closed)
+    if seq is None:
+        return []
+
+    # Stitch the chosen candidate sequence into a guaranteed connected walk,
+    # continuing from wherever each leg actually ends (route_contour's rule).
+    route, cur = [], cand[0][seq[0]]
+    for j in range(nlegs):
+        j2 = (j + 1) % M
+        part = leg_path(cur, cand[j2][seq[j2]], leg_seg(j, j2))
+        if not part:
+            continue
+        route.extend(part[1:] if route else part)
+        cur = route[-1]
+    if closed and len(route) >= 2 and route[0] != route[-1]:
+        route.append(route[0])
+    return route
+
+
 # --------------------------------------------------------------------------- #
 # Cleanup                                                                      #
 # --------------------------------------------------------------------------- #
@@ -1513,9 +1691,18 @@ def on_land(placed, grid, cfg):
 # --------------------------------------------------------------------------- #
 # Fidelity metrics                                                            #
 # --------------------------------------------------------------------------- #
-def hausdorff(route, contour):
-    """Symmetric Hausdorff distance between two polylines (lower is better)."""
-    r, c = np.asarray(route), np.asarray(contour)
+def hausdorff(route, contour, samples=600):
+    """Symmetric Hausdorff distance between two curves (lower is better).
+
+    Both inputs are resampled to a uniform arc-length density first. Without it
+    the distance is measured to the other polyline's *vertices*, so a sparse
+    target -- a square's outline is only its 4 corners under CHAIN_APPROX_SIMPLE
+    -- makes a perfectly-traced mid-edge point look ~half an edge (here up to
+    ~12 avg-edges) away, inflating Hausdorff into a phantom "excursion". Sampling
+    the curves makes this a true curve-to-curve distance (e.g. square 0.29 -> 0.02).
+    """
+    r = resample(route, n=samples)
+    c = resample(contour, n=samples)
     dr, _ = cKDTree(c).query(r)
     dc, _ = cKDTree(r).query(c)
     return float(max(dr.max(), dc.max()))
@@ -1942,6 +2129,20 @@ CONFIG = dict(
     # penalty would otherwise fight. The input-side low-pass remains the only
     # measured clean visual win; this is the router-side complement.
     turn_weight=0.0,
+
+    # Trellis routing (route_contour_trellis). Instead of snapping each anchor to
+    # its single nearest node and forcing the path through it -- where one bad
+    # snap becomes one big excursion (the lshape/square/Knight Hausdorff spikes)
+    # -- give each anchor its trellis_k nearest candidate nodes and pick the
+    # globally cheapest sequence with an exact first-order DP (transition = the
+    # contour-biased leg length, emission = trellis_emit_weight * node-to-anchor
+    # distance). Since the single-snap path is one lattice path, the DP is never
+    # worse on that objective; it also lets the route "jump" a bad side-pocket
+    # (subsumes the jump-field idea) and threads turn_weight through the legs. Run
+    # only on the chosen placements (decoupled from selection, like turn_weight).
+    trellis=False,
+    trellis_k=3,
+    trellis_emit_weight=6.0,
 
     # Granularity: 0.0 = smooth, fewer steps, shorter and easier to run;
     #              1.0 = trace every jog of the shape, longer and more expressive.

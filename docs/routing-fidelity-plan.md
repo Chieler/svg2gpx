@@ -6,8 +6,9 @@ layers. This is the counterpart to [`rendering-fidelity-plan.md`](rendering-fide
 which attacks the same artifact from the *input* side (Fourier low-pass matches
 the target's detail to the grid's Nyquist). The two are complementary: low-pass
 lowers the *demand* for combing, the changes here lower the *supply*.
-**Status: Phase 0 + Phase 1 + Phase 2 implemented (Phase 2 ships default-OFF,
-see below); Phase 3+ proposed.**
+**Status: Phase 0–3 implemented. Phase 0 (metric) + the Phase-3 Hausdorff fix
+ship default-ON; the Phase-2 turn penalty and Phase-3 trellis ship default-OFF
+as documented knobs (neither is a clean win — see below).**
 
 ## Diagnosis (measured on the synthetic 50×50 lattice, all bundled shapes)
 
@@ -44,13 +45,13 @@ an **independent combing metric + visual A/B**, not by the routing cost.
 | --- | --- | --- | --- |
 | A. Turn-penalized Dijkstra | `cost = len + weight·dist_to_outline(nbr)`, state = node only | ✅ (`gen.py` `route_pair`) | **done (Phase 2), default-OFF** |
 | C. dissolve_oscillations | shortcut_nooks keeps a tooth that hugs the outline | ✅ | **done (Phase 1)** |
-| Change 1. Viterbi trellis | snap picks one node per anchor; a bad node compromises the path | ✅ | high value (Phase 3) |
+| Change 1. Viterbi trellis | snap picks one node per anchor; a bad node compromises the path | ✅ | **done (Phase 3), default-OFF; exposed the Hausdorff artifact** |
 | Change 3. Monotonicity prune | combing = backward motion for micro-gain | plausible | fold into A as a *soft* term |
 | Change 2. Static cost maps | closure called on *every neighbor expansion* | ❌ it is **memoized per node** (`dev` dict) | defer (perf, not a bottleneck) |
 | Change 4. Graph coarsening | `_densify_edge` inflates node depth | ❌ **no-op on the benchmark** (synthetic grid isn't densified) | defer (fights the design) |
 | B. Skeleton + component warp | affine can't fit body + limb; align limbs to `grid.grid_angle` | ⚠️ partly | highest risk, prototype apart |
 | 1. Variable momentum weight | "instead of a static TURN_WEIGHT…" | ❌ **no TURN_WEIGHT exists** | it's a modulation *of* A |
-| 2. Jump fields at junctions | leap across bad pockets | — | subsumed by Change 1 |
+| 2. Jump fields at junctions | leap across bad pockets | — | **done — subsumed by the Change 1 trellis** |
 
 Concrete discrepancies to keep in mind when implementing:
 
@@ -149,12 +150,45 @@ target, which has already shed the sub-block detail the penalty fights — so th
 natural next step is to gate `turn_weight` on (low corner-content ∧ FD-low-pass
 applied).
 
-### Phase 3 — Viterbi/trellis snap + route (proposed)
-Replace single-node snapping with `query_ball_point` candidate sets + a DP whose
-transition cost is the **contour-biased `route_pair` cost** (not plain
-shortest-path, which would drop the hugging) and emission = contour proximity.
-Fixes the *other* failure mode — the lshape/square/Knight big-Hausdorff
-excursions that turn penalties can't touch — and subsumes Idea 2.
+### Phase 3 — Viterbi/trellis snap + route (done; ships default-OFF)
+Implemented. `route_contour_trellis` gives each anchor its `trellis_k` nearest
+candidate nodes and picks the globally cheapest sequence with an exact
+first-order DP (`_trellis_dp`): transition = the contour-biased `route_pair` cost
+(length + `weight`·deviation, so legs *hug* the outline, not just stay short),
+emission = `trellis_emit_weight`·node-to-anchor distance. Because the objective is
+additive and first-order it satisfies Bellman, and the single-snap path is one
+lattice path so the DP is never worse *on that surrogate*. It subsumes Idea 2
+(it "jumps" a bad side-pocket by preferring a neighbour) and threads `turn_weight`
+through the legs (couples Phase 2). Decoupled from selection and locked by a unit
+test (closed connected walk; `trellis_k=1` degenerates to single-snap).
+
+**Two findings, one clean win and one honest null.**
+
+- **The "big-Hausdorff excursion" failure mode did not exist — it was a metric
+  artifact.** `hausdorff` compared the route against the *raw* `placed` polyline,
+  which under `CHAIN_APPROX_SIMPLE` is only a square's 4 corners / an L's 8 — so a
+  perfectly-traced mid-edge point read as ~half an edge (up to ~12 avg-edges) from
+  the nearest *vertex*, a phantom excursion. Densifying inside `hausdorff` (it now
+  resamples both curves, like `frechet`/`dtw`) collapses square 0.29→0.02, lshape
+  0.29→0.02: **the routes were near-perfect all along.** This is the actual clean
+  win of the phase — a trustworthy Hausdorff column — and it ships default-ON.
+- **The trellis itself is not a clean win → default-OFF.** With the corrected
+  metric, full-pipeline A/B is `haus 0.036→0.040, frechet 0.038→0.043,
+  iou 0.643→0.646, excess 17.1→16.6`: it helps some shapes (face IoU 0.67→0.70,
+  star Hausdorff 0.054→0.043) and hurts others (Crow/Knight Frechet), net slightly
+  negative on the order-aware metrics. This is precisely the Bellman caveat made
+  concrete: **exact on the additive surrogate ≠ better true fidelity**, because
+  the surrogate (length + deviation + emission) doesn't track Frechet. So, like
+  `turn_weight`, it ships correct, decoupled, unit-tested, and **default-OFF**
+  (`trellis=False`), a knob rather than a default.
+
+This is the fourth experiment to land on the same verdict (after the void term,
+the recognition term, and the turn penalty): **router/selection-side objectives
+move their own metric but are not a clean visual win; the input-side FD low-pass
+is.** The trellis's real payoff would need a *better transition cost* — one that
+tracks perceptual/turning fidelity rather than raw length+deviation — and/or a
+node-pair (second-order) state carrying the anchor-boundary turn, which is the
+BPO-correct way to fold `turn_weight` across legs. Both are future work.
 
 ### Deferred / prototype-behind-a-flag
 Change 2 (perf-only, semantics-changing, not a bottleneck). Idea B + Change 4
