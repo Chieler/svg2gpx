@@ -246,6 +246,22 @@ built on. Default-ON (`fd_lowpass=True`), gated; set `fd_lowpass=False` to disab
 > so a wider real-grid sweep — and deriving `fd_harmonics` from the real
 > blocks-per-shape rather than a fixed 20 — should precede a firm default.
 
+> **Per-family engine comparison on Chicago (sharp vs FD vs trellis —
+> [`chicago_maps/engines_chicago.png`](../chicago_maps/engines_chicago.png)).**
+> The engines split by shape family, but along **elongation, not
+> blob-vs-angular** (means, IoU / turning): *angular* sharp 0.31/0.78, FD
+> **0.32/0.71**, trellis 0.30/0.79; *blob* sharp **0.36**/0.76, FD 0.35/**0.67**,
+> trellis **0.36**/0.72; *mixed* all 0.32, FD best turning 1.21. FD low-pass helps
+> shapes with long sweeping edges (Shark IoU 0.33→0.35 turn 1.34→1.11; star turn
+> 0.84→0.63) but **rounds compact feature-rich shapes into mush** (Knight IoU
+> 0.33→0.30 — visually a lump; Pawn 0.38→0.34; Crow 0.39→0.32). Compact/defined
+> shapes want the crisp engine — sharp, or **trellis**, which matches sharp's IoU
+> without FD's damage and shaves turning on a few (circle, Cat). Consequence: the
+> current FD gate keys only on "does it smooth the turning," so it **mis-fires on
+> Knight/Pawn/Crow**. The fix is an **elongation-aware gate** (apply FD only where
+> long edges dominate — high aspect / long straight runs — skip compact
+> feature-rich shapes), which would make FD default-ON fire only where it helps.
+
 **Re-test of the router knobs on the low-passed target (measured).** The
 hypothesis was that `turn_weight` / `trellis` were penalized for corner-rounding
 they no longer need once the sub-block detail is gone. Measured over all shapes
