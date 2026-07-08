@@ -571,6 +571,60 @@ def waypoint_importance(pts, k=4):
 
 
 # --------------------------------------------------------------------------- #
+# Fourier-descriptor low-pass of the target                                    #
+# --------------------------------------------------------------------------- #
+def fourier_lowpass(pts, harmonics, samples=512):
+    """Low-pass a closed contour to its first `harmonics` Fourier descriptors.
+
+    The outline is a raster trace with sub-block wiggle the street grid cannot
+    draw; above the grid's Nyquist the router renders that detail as staircase /
+    comb (aliasing). Representing the loop as z(t)=x(t)+i*y(t), keeping only the
+    low harmonics, and reconstructing removes the un-drawable detail *at the
+    input*, so the router is asked to trace a shape the streets can actually
+    render. Organic shapes reconstruct cleanly at K~12-20 and shed the SVG's
+    raster jaggies; sharp corners need high harmonics, so pointy shapes must be
+    gated out (see _fd_corner_shift).
+    """
+    p = resample(pts, n=samples, closed=True)[:-1]     # uniform, drop closing dup
+    z = p[:, 0] + 1j * p[:, 1]
+    Z = np.fft.fft(z)
+    n = len(Z)
+    k = int(max(1, harmonics))
+    if 2 * k + 1 < n:
+        Z[k + 1:n - k] = 0.0                           # keep DC + harmonics -k..k
+    w = np.fft.ifft(Z)
+    return _close(np.column_stack([w.real, w.imag]))
+
+
+def maybe_lowpass_contour(contour, cfg):
+    """Apply the Fourier low-pass when enabled AND the corner gate allows it.
+
+    Two-part gate, both on the outline's total absolute turning:
+
+      * it must have detail worth removing -- turning above `fd_detail_turns` x
+        2*pi (a convex loop is exactly 2*pi; a smooth circle/donut sits near it
+        even from raster, so low-passing them only shuffles the placement and
+        can't help), and
+      * the low-pass must *smooth* it -- cut turning by at least `fd_min_turn_drop`.
+        An organic shape sheds raster jaggies and sub-block wiggle (turning drops
+        a lot); a shape of straight edges meeting sharp corners (a square, an L)
+        instead rings (Gibbs) and turning *rises*, so those keep their crisp
+        target. This separates the families where a corner-displacement test
+        cannot -- a star's tips and a horse's legs move alike, but only the
+        former rings.
+    """
+    if not cfg.get("fd_lowpass", False):
+        return contour
+    K = int(cfg.get("fd_harmonics", 20))
+    lp = fourier_lowpass(contour, K)
+    raw_turn = _total_abs_turning(resample(contour, n=400))
+    lp_turn = _total_abs_turning(resample(lp, n=400))
+    has_detail = raw_turn > cfg.get("fd_detail_turns", 3.0) * 2.0 * np.pi
+    smooths = lp_turn <= (1.0 - cfg.get("fd_min_turn_drop", 0.15)) * raw_turn
+    return lp if (has_detail and smooths) else contour
+
+
+# --------------------------------------------------------------------------- #
 # Placement search                                                            #
 # --------------------------------------------------------------------------- #
 def _score(placed, grid, scale, cfg, importance,
@@ -872,6 +926,10 @@ def search_placement(contour, grid, cfg, inners=None):
     placement escapes it, so the caller presents several to choose from.
     """
     rng = np.random.default_rng(cfg["seed"])
+    # Fourier low-pass the *target* (gated, so it never rounds a pointy shape's
+    # corners): the router then traces a shape the street grid can actually
+    # render, instead of chasing sub-block detail it can only staircase/comb.
+    contour = maybe_lowpass_contour(np.asarray(contour, dtype=np.float64), cfg)
     base = resample(contour, n=250)          # cheap, transform-invariant proxy
     importance = waypoint_importance(base)   # which of those points define the shape
     s_lo, s_hi = cfg["scale_range"]
@@ -2143,6 +2201,20 @@ CONFIG = dict(
     trellis=False,
     trellis_k=3,
     trellis_emit_weight=6.0,
+
+    # Fourier-descriptor low-pass of the TARGET (maybe_lowpass_contour). Keeps
+    # only the first fd_harmonics harmonics of the closed outline, so the router
+    # traces a shape the street grid can render instead of chasing sub-block
+    # detail it can only staircase/comb. This is an INPUT-side change (it does not
+    # touch any cost the search optimizes), which is why -- unlike the router-side
+    # turn_weight / trellis knobs -- it is a net win here and ships default-ON,
+    # gated so it only fires on shapes with detail worth removing that it actually
+    # smooths (not sharp shapes it would ring, nor already-smooth ones it can't
+    # help). See docs/routing-fidelity-plan.md and docs/rendering-fidelity-plan.md.
+    fd_lowpass=True,
+    fd_harmonics=20,          # grid Nyquist ~ blocks-per-shape / 2
+    fd_detail_turns=3.0,      # only shapes whose turning exceeds this x 2*pi
+    fd_min_turn_drop=0.15,    # and that the low-pass smooths by >= this fraction
 
     # Granularity: 0.0 = smooth, fewer steps, shorter and easier to run;
     #              1.0 = trace every jog of the shape, longer and more expressive.

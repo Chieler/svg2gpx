@@ -130,8 +130,26 @@ def main():
     dissolve_checks()
     momentum_checks()
     trellis_checks()
+    fd_lowpass_checks()
 
     print("\nall routing checks passed")
+
+
+def fd_lowpass_checks():
+    """Fourier low-pass smooths a detailed outline, and the gate fires on organic
+    shapes (it smooths them) but skips sharp ones (it would ring them)."""
+    turn = lambda c: gen._total_abs_turning(gen.resample(c, n=400))
+    horse = gen.extract_contour("shapes/Horse.svg", 512)
+    lp = gen.fourier_lowpass(horse, 20)
+    check(turn(lp) < turn(horse), "fourier_lowpass reduces a detailed outline's turning")
+
+    cfg = {**gen.CONFIG, "fd_lowpass": True}
+    fires = lambda s: not np.array_equal(
+        gen.maybe_lowpass_contour(
+            np.asarray(gen.extract_contour(f"shapes/{s}.svg", 512), dtype=float), cfg),
+        np.asarray(gen.extract_contour(f"shapes/{s}.svg", 512), dtype=float))
+    check(fires("Horse"), "gate applies the low-pass to an organic shape (horse)")
+    check(not fires("square"), "gate skips the low-pass on a sharp shape (square rings)")
 
 
 def trellis_checks():

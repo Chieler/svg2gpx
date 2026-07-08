@@ -6,9 +6,10 @@ layers. This is the counterpart to [`rendering-fidelity-plan.md`](rendering-fide
 which attacks the same artifact from the *input* side (Fourier low-pass matches
 the target's detail to the grid's Nyquist). The two are complementary: low-pass
 lowers the *demand* for combing, the changes here lower the *supply*.
-**Status: Phase 0–3 implemented. Phase 0 (metric) + the Phase-3 Hausdorff fix
-ship default-ON; the Phase-2 turn penalty and Phase-3 trellis ship default-OFF
-as documented knobs (neither is a clean win — see below).**
+**Status: Phase 0–4 implemented. Default-ON: Phase 0 (metric), the Phase-3
+Hausdorff fix, and Phase 4 (Fourier low-pass — the clean win, 6/7 metrics up).
+Default-OFF knobs (neither a clean win on its own): the Phase-2 turn penalty and
+the Phase-3 trellis — both worth re-testing on the low-passed target.**
 
 ## Diagnosis (measured on the synthetic 50×50 lattice, all bundled shapes)
 
@@ -189,6 +190,44 @@ is.** The trellis's real payoff would need a *better transition cost* — one th
 tracks perceptual/turning fidelity rather than raw length+deviation — and/or a
 node-pair (second-order) state carrying the anchor-boundary turn, which is the
 BPO-correct way to fold `turn_weight` across legs. Both are future work.
+
+### Phase 4 — Fourier low-pass of the target (done; the clean win, ships default-ON)
+The input-side lever from `rendering-fidelity-plan.md`, finally wired in and
+measured on this benchmark. `fourier_lowpass` represents the closed outline as
+`z(t)=x(t)+i·y(t)`, keeps the first `fd_harmonics` (=20, the grid Nyquist), and
+reconstructs; `maybe_lowpass_contour` applies it at the top of `search_placement`
+so the router traces a grid-renderable shape instead of chasing sub-block detail
+it can only staircase. See [`fd-lowpass-gate.png`](fd-lowpass-gate.png).
+
+The gate is two-part, both on the outline's total absolute turning: (1) it must
+have detail worth removing — turning above `fd_detail_turns`·2π (a smooth
+circle/donut sits near 2π even from raster, so low-passing it only reshuffles the
+placement); (2) the low-pass must *smooth* it — cut turning by ≥ `fd_min_turn_drop`.
+A square/L of straight edges meeting sharp corners **rings** (Gibbs) and its
+turning *rises*, so it is skipped and keeps its crisp target. This separates the
+families a corner-displacement test could not (a star's tips and a horse's legs
+move alike, but only the former rings). Applied to Crow/Horse/Knight/Pawn/Shark/
+star; skipped on Cat/circle/donut/face/lshape/square (all byte-identical).
+
+**Measured, full benchmark (the first default-ON win of this effort):**
+`frechet 0.0376→0.0338, hausdorff 0.0362→0.0317, iou 0.643→0.654,
+perceptual 0.032→0.029, turning 0.474→0.379 (−20%)` — six of seven metrics
+improve, with standouts Horse (IoU 0.54→0.65, 162→147 nodes) and star
+(Frechet 0.046→0.034). The seventh, `excess`, *rises* 17→23, but that is a
+**reference artifact, not a regression**: `excess = route_turning −
+target_turning`, and the low-passed target has less turning, so the surplus grows
+even as the route's own turning and node count fall. The clean cross-condition
+signals are route-intrinsic (node count ↓, absolute turning ↓) and the
+form-metric `turning` (↓20%); the gate + the figure confirm the smoothed target
+still reads as the shape. Why this wins where the router knobs didn't: it changes
+the *input*, never a cost the search optimizes — the discipline the whole plan is
+built on. Default-ON (`fd_lowpass=True`), gated; set `fd_lowpass=False` to disable.
+
+Natural follow-ups now unblocked: the `turn_weight` and `trellis` knobs should be
+re-tested *on the low-passed target* (their corner-rounding is largely moot once
+the sub-block detail they fought is already gone — they may flip to net-positive),
+and `fd_harmonics` could be derived per-run from the placed blocks-per-shape
+rather than fixed at 20.
 
 ### Deferred / prototype-behind-a-flag
 Change 2 (perf-only, semantics-changing, not a bottleneck). Idea B + Change 4
