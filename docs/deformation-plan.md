@@ -123,27 +123,47 @@ The distance metrics aren't discarded — they're *re-scoped* to (4), the one
 question they can actually answer. Recognizability lives in (1), (2) and (5),
 calibrated against the human-verdict set (plan §4).
 
-## Immediate fix shipped alongside: orientation is identity (`rot_max`)
+## Orientation: a display concern, not an identity one (`rot_max` off)
 
-The Shark regression on this branch was measured and diagnosed: the placement
-search selected a ~90°-rotated (vertical) Shark because it scored *highest
-overlap* (IoU 0.47) — and a rotated shark stops reading as a shark at perfect
-overlap, which no overlap metric notices. That is reason #1 from the
-recognizability plan (adherence metrics can't see identity) biting in
-production. Fix: `rot_max` (default ±35°) caps placement rotation around the
-drawn orientation; `reflect` still allows facing either way; ±35° nearly covers
-a 72–90° symmetry period so star/square lose little seating freedom; `None`
-restores free spin for orientation-free shapes. In the ARAP formulation this
-becomes a global-rotation term of the same energy.
+The vertical-Shark placement was first read as an identity failure and a
+`rot_max=±35°` cap was tried — then reverted on the correct observation that
+**the finished route is map art the viewer can rotate**: a "vertical shark" is
+fine because the print/phone can be turned. The knob remains (default `None` =
+free spin) for the one context where orientation genuinely matters: embedding
+in a fixed north-up map next to labels. Recognizability judging (semantic
+oracles, human verdicts) should likewise evaluate renders at the figure's
+canonical orientation, not north-up.
 
-## Plan
+## Plan & prototype results
 
-1. **Prototype (snake form, #3)**: bend stage between placement and snapping on
-   the Chicago window; eyeball A/B + energy report. No pipeline surgery — it
-   transforms `placed` before `snap_waypoints`.
-2. If the eyeball agrees: **productionize as ARAP local–global (#1) with
-   stiffness annealing (#2)**, expose the identity budget `B`, wire the energy
-   breakdown + feature ledger into the benchmark as the new fidelity columns.
-3. Evaluate **schematization (#4)** only if soft attraction leaves staircase.
-4. Calibrate everything against the human-verdict set (plan §4) before trusting
-   any of it as a gate.
+1. **Prototype — DONE (`bend_template` in gen.py, ships default-OFF).** Full
+   1-D ARAP local–global (per-vertex closed-form Procrustes rotations + one
+   cyclic-Laplacian solve per round) with stiffness-annealed attraction, i.e.
+   #1 + #2 directly rather than the gradient snake. Two attraction variants
+   were measured on Chicago @ r2400:
+   - *node attraction*: template street-distance −40% at only 0.015–0.03
+     perceptual change (physics works), but the bent target wobbles
+     node-to-node → route turning +10%, IoU unchanged;
+   - *segment-projection attraction* (consecutive points project onto the same
+     street → collinear targets → stretches settle along block faces): wobble
+     gone, but end-to-end still **neutral** — IoU ties on all four shapes,
+     renders indistinguishable.
+
+   **Why neutral, and what it teaches:** snapping + the contour-biased router +
+   cleanup already form a discretizer that absorbs sub-block mismatch. Bending
+   the target ≤ half a block therefore doesn't change *which streets* the route
+   takes — the router was already choosing those streets. The remaining quality
+   gap on this canvas is **corridor-scale** (which street a limb lies along,
+   resolution, template demand), not sub-block alignment. Consistent with every
+   other measured result: resolution (+0.10 IoU) and template demand (RDP) moved
+   the picture; sub-block cleverness did not.
+2. **v2 — corridor-scale ARAP (the version with leverage):** raise the pull far
+   beyond the sub-block regime so limbs can relocate onto *different* streets,
+   governed by the **identity budget** `E_identity ≤ B` so the figure cannot
+   dissolve; add self-intersection guards for thin limbs. This is where the
+   registration idea stops duplicating the router and starts doing something the
+   router cannot: block-level re-draping of the figure onto the fabric.
+3. Evaluate **schematization (#4)** as the discrete alternative if v2's soft
+   attraction proves hard to control.
+4. Calibrate everything against the human-verdict set
+   (recognizability-plan §4) before trusting any number as a gate.

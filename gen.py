@@ -601,6 +601,102 @@ def simplify_template(contour, max_vertices):
     return _close(best.reshape(-1, 2).astype(np.float64) / 4096.0)
 
 
+def bend_template(placed, grid, cfg):
+    """Elastically bend the placed template onto the street fabric (1-D ARAP).
+
+    The router can only draw along streets; a template line crossing blocks at
+    an arbitrary angle gets rendered as staircase however well it is routed.
+    Instead of asking the router to alias the mismatch away, deform the template
+    itself -- like an elastic wire pressed onto the lattice -- so its lines lie
+    ALONG streets before snapping ever happens. "As rigid as possible" is the
+    identity guarantee: local rotation is free, but stretching an edge or
+    changing a corner angle relative to the template costs energy, so a fin
+    stays a fin; it just leans onto the nearest street.
+
+    Formulation (local-global ARAP on the closed polyline, attraction annealed
+    like non-rigid ICP so global pose settles before limbs flex):
+
+        E = sum_j ||(P_{j+1}-P_j) - R(theta) E_j||^2 + lam * sum_i ||P_i - Q_i||^2
+
+    where E_j are the placed template's edge vectors, per-vertex rotations
+    R(theta_i) come from a closed-form 2-D Procrustes over each vertex's two
+    incident edges, Q_i is the nearest street node (densified nodes sit every
+    ~node_spacing metres, so nearest-node ~= nearest street point), and lam
+    ramps from loose to `bend_pull` over `bend_iters` rounds. The global step
+    is one cyclic tridiagonal solve per round. Returns a closed polyline.
+
+    Attraction targets are projections onto street SEGMENTS, not nodes: node
+    targets are discrete, so a polyline chasing them wobbles node-to-node;
+    segment projections of consecutive points land on the same street and are
+    collinear, so the solve pulls whole stretches into straight runs along the
+    block face -- the "elastic sheet pressed onto the lattice" behaviour, with
+    no explicit direction term needed. Known prototype limit: nothing yet
+    prevents a very thin limb from self-intersecting under heavy pull (see
+    docs/deformation-plan.md for the full formulation and roadmap).
+    """
+    ref = resample(placed, step=grid.avg_edge * cfg.get("bend_spacing", 0.75))
+    ref = np.asarray(ref[:-1], dtype=np.float64)     # cyclic: drop closing dup
+    n = len(ref)
+    if n < 8:
+        return placed
+    E = np.roll(ref, -1, axis=0) - ref               # reference edge vectors
+    P = ref.copy()
+    lam_final = cfg.get("bend_pull", 1.5)
+    outers = max(1, int(cfg.get("bend_iters", 8)))
+    I = np.eye(n)
+    L = 2.0 * I - np.roll(I, 1, axis=0) - np.roll(I, -1, axis=0)   # cyclic Laplacian
+
+    # Street segments for projection targets (edges are ~avg_edge long, so the
+    # nearest few midpoints reliably contain the truly nearest segment).
+    if grid.edge_list:
+        segA = np.asarray([e[0] for e in grid.edge_list], dtype=np.float64)
+        segB = np.asarray([e[1] for e in grid.edge_list], dtype=np.float64)
+        seg_tree = cKDTree(0.5 * (segA + segB))
+        segD = segB - segA
+        segL2 = np.maximum(np.einsum("ij,ij->i", segD, segD), 1e-18)
+    else:
+        seg_tree = None
+
+    def attract(pts):
+        """Per point: the closest point on the nearest street segment."""
+        if seg_tree is None:
+            return grid.nodes_arr[grid.tree.query(pts)[1]]
+        k = min(8, len(segA))
+        idx = seg_tree.query(pts, k=k)[1].reshape(len(pts), -1)
+        a, d = segA[idx], segD[idx]                          # (n, k, 2)
+        t = np.einsum("nkj,nkj->nk", pts[:, None, :] - a, d) / segL2[idx]
+        proj = a + np.clip(t, 0.0, 1.0)[..., None] * d
+        dist = np.einsum("nkj,nkj->nk", proj - pts[:, None, :],
+                         proj - pts[:, None, :])
+        return proj[np.arange(len(pts)), np.argmin(dist, axis=1)]
+
+    for it in range(outers):
+        lam = lam_final * (it + 1) / outers          # stiffness annealing
+        Q = attract(P)                               # attraction targets
+        A = L + lam * I
+        for _ in range(3):                           # local-global iterations
+            e_cur = np.roll(P, -1, axis=0) - P
+            # Local: per-vertex Procrustes rotation over the two incident edges
+            # (edges i-1 and i). M = sum outer(e_cur, e_ref); theta from atan2.
+            cp, rp = np.roll(e_cur, 1, axis=0), np.roll(E, 1, axis=0)
+            m00 = cp[:, 0] * rp[:, 0] + e_cur[:, 0] * E[:, 0]
+            m01 = cp[:, 0] * rp[:, 1] + e_cur[:, 0] * E[:, 1]
+            m10 = cp[:, 1] * rp[:, 0] + e_cur[:, 1] * E[:, 0]
+            m11 = cp[:, 1] * rp[:, 1] + e_cur[:, 1] * E[:, 1]
+            th = np.arctan2(m10 - m01, m00 + m11)
+            c, s = np.cos(th), np.sin(th)
+            # Edge j's target = mean of its two endpoint rotations applied to E_j.
+            rx = c * E[:, 0] - s * E[:, 1]           # R(theta_j) E_j
+            ry = s * E[:, 0] + c * E[:, 1]
+            c2, s2 = np.roll(c, -1), np.roll(s, -1)  # R(theta_{j+1}) E_j
+            tx = 0.5 * (rx + c2 * E[:, 0] - s2 * E[:, 1])
+            ty = 0.5 * (ry + s2 * E[:, 0] + c2 * E[:, 1])
+            T = np.column_stack([np.roll(tx, 1) - tx, np.roll(ty, 1) - ty])
+            # Global: (L + lam I) P = T + lam Q, one solve per coordinate.
+            P = np.linalg.solve(A, T + lam * Q)
+    return np.vstack([P, P[:1]])
+
+
 # --------------------------------------------------------------------------- #
 # Placement search                                                            #
 # --------------------------------------------------------------------------- #
@@ -682,6 +778,8 @@ def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
 
 def build_route(grid, placed, cfg):
     """Run the full snap -> route -> cleanup pipeline for one placement."""
+    if cfg.get("bend_template", True):
+        placed = bend_template(placed, grid, cfg)
     dense, waypoints, wp_idx = snap_waypoints(placed, grid, cfg)
     if len(waypoints) < 3:
         return [], dense, waypoints
@@ -1709,13 +1807,13 @@ CONFIG = dict(
     # original Manhattan-blocks rationale for the wide caps).
     aspect_max=1.15,          # max area-preserving stretch (1.0 = uniform scale)
     shear_max=0.05,           # max skew, for non-orthogonal grids
-    # Orientation is identity too: a 90 deg-rotated shark stops reading as a
-    # shark at perfect overlap, and no overlap metric notices (this exact
-    # failure selected a vertical Shark on Chicago). Cap rotation around the
-    # drawn orientation; reflect still allows facing either way. +/-35 deg
-    # nearly covers a 72-90 deg symmetry period, so star/square lose little
-    # seating freedom. None = free spin (orientation-free abstract shapes).
-    rot_max=35.0,
+    # Rotation cap around the drawn orientation (degrees), None = free spin.
+    # OFF by default: the finished route is map art the viewer can rotate, so
+    # orientation is a display concern, not an identity one -- a "vertical
+    # shark" placement is fine because the print/phone can be turned. Set a
+    # value only when the rendering context has a fixed north (e.g. embedding
+    # in a north-up map next to labels).
+    rot_max=None,
     reflect=True,             # also search mirror-image placements (a shark faces
                               #   either way): doubles the orientations available to
                               #   line the outline up with the streets
@@ -1741,6 +1839,24 @@ CONFIG = dict(
     # outline is within `land_reach` average edges of a street node.
     min_land_fraction=0.85,
     land_reach=2.5,
+
+    # Elastic template bending (bend_template, EXPERIMENTAL, default OFF):
+    # before snapping, deform the placed template onto the street fabric with a
+    # 1-D ARAP solve -- local rotation free, stretch/corner change charged, and
+    # attraction to street-segment projections so stretches settle ALONG block
+    # faces. Physics validated (street distance -40% at ~0.02-0.03 perceptual
+    # change), but end-to-end A/B on Chicago is NEUTRAL: snapping + the
+    # deviation router + cleanup already absorb sub-block mismatch, so a
+    # half-block pre-alignment doesn't change which streets are chosen. The
+    # lever only matters at corridor scale (bending a limb onto a DIFFERENT
+    # street), which needs a much stronger pull governed by an identity budget
+    # -- the v2 in docs/deformation-plan.md. bend_pull is the final attraction
+    # strength (annealed over bend_iters); bend_spacing is the working
+    # resolution in avg-edges.
+    bend_template=False,
+    bend_pull=1.5,
+    bend_iters=8,
+    bend_spacing=0.75,
 
     # Routing / fidelity.
     deviation_weight=60.0,    # >> 1 makes "stay on the outline" dominate cost
