@@ -40,6 +40,7 @@ from gen import (
     Grid,
     dtw,
     extract_contour,
+    feature_ledger,
     format_distance,
     frechet,
     hausdorff,
@@ -153,11 +154,13 @@ def run_case(grid, case, cfg):
 
     best = ranked[0]
     cost, placed, route = best.cost, best.placed, best.route
+    led = feature_ledger(route, placed) if len(route) >= 2 else None
     if len(route) < 2:
         return {"name": case["name"], "nodes": len(route), "cost": cost,
                 "frechet": float("nan"), "hausdorff": float("nan"), "iou": 0.0,
                 "perceptual": float("nan"), "dtw": float("nan"),
-                "turning": float("nan"), "on_land": 0.0, "length_m": 0.0,
+                "turning": float("nan"), "led_r": 0.0, "led_p": 0.0,
+                "on_land": 0.0, "length_m": 0.0,
                 "t_contour": t_contour, "t_search": t_search}
 
     return {
@@ -170,6 +173,8 @@ def run_case(grid, case, cfg):
         "perceptual": perceptual_cost(route, placed),
         "dtw": dtw(route, placed),
         "turning": turning_distance(route, placed),
+        "led_r": led["recall"],
+        "led_p": led["precision"],
         "on_land": land_fraction(placed, grid) * 100.0,
         "length_m": route_length_m(route, grid),
         "t_contour": t_contour,
@@ -188,6 +193,8 @@ COLUMNS = [
     ("perceptual", "percept", 8, lambda v: f"{v:>8.4f}"),
     ("dtw", "DTW", 8, lambda v: f"{v:>8.4f}"),
     ("turning", "turning", 8, lambda v: f"{v:>8.4f}"),
+    ("led_r", "led_R", 6, lambda v: f"{v:>6.2f}"),
+    ("led_p", "led_P", 6, lambda v: f"{v:>6.2f}"),
     ("cost", "cost", 8, lambda v: f"{v:>8.4f}"),
     ("on_land", "land%", 6, lambda v: f"{v:>6.0f}"),
     ("length_m", "dist", 16, lambda v: f"{v:>16}"),
@@ -224,12 +231,13 @@ def _print_summary(results):
           f"Frechet={mean('frechet'):.4f}  Hausdorff={mean('hausdorff'):.4f}  "
           f"IoU={mean('iou'):.3f}  perceptual={mean('perceptual'):.4f}  "
           f"DTW={mean('dtw'):.4f}  turning={mean('turning'):.4f}  "
+          f"ledgerR={mean('led_r'):.2f}  ledgerP={mean('led_p'):.2f}  "
           f"t_route={mean('t_search'):.2f}s")
 
 
 def write_csv(results, path):
     fields = ["name", "nodes", "frechet", "hausdorff", "iou", "perceptual",
-              "dtw", "turning", "cost", "on_land", "length_m",
+              "dtw", "turning", "led_r", "led_p", "cost", "on_land", "length_m",
               "t_contour", "t_search"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)

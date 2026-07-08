@@ -114,8 +114,15 @@ Shark 0.33→0.46, star 0.31→0.41, and the renders visibly read as the animals
    auto-scaling it belongs with the fetch layer).
 
 ## Follow-ups
-- Implement the **feature ledger** metric (§2) and calibrate all metrics against
-  a first human-verdict set (§4).
+- ~~Implement the **feature ledger** metric (§2)~~ **done**: `feature_ledger`
+  in gen.py (macro-corners via RDP, cyclic order-preserving DP matching,
+  turn-weighted recall / precision / angle error), unit-tested (identity /
+  clipped corner / comb tooth) and wired into `benchmark.py` as `led_R`/`led_P`
+  columns. It already discriminates where IoU can't: a Chicago star scored
+  IoU 0.43 with recall 0.47 — half its defining corners missing, invisible to
+  overlap. It also meters the deformation stage's identity budget
+  (`docs/deformation-plan.md`). Still to do: calibrate against a first
+  human-verdict set (§4).
 - QuickDraw judge prototype (§3) once weights can be fetched.
 - `target_blocks` auto-scale in the fetch layer.
 - Walk-network (alleys/footpaths) remains the blocked ~2× resolution lever

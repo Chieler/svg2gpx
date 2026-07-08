@@ -90,7 +90,36 @@ def main():
           "pipeline smoke: star route is a connected walk")
     check(cand.route[0] == cand.route[-1], "pipeline smoke: star route is closed")
 
+    ledger_checks()
+
     print("\nall routing checks passed")
+
+
+def ledger_checks():
+    """feature_ledger: perfect on identity, catches lost corners (recall) and
+    invented corners (precision) -- the two identity failures IoU cannot see."""
+    sq = np.array([(0., 0.), (1., 0.), (1., 1.), (0., 1.), (0., 0.)])
+    led = gen.feature_ledger(sq, sq)
+    check(led["recall"] > 0.99 and led["precision"] > 0.99,
+          "ledger: identity square scores recall=precision=1")
+
+    clipped = np.array([(0., 0.), (1., 0.), (1., .8), (.8, 1.), (0., 1.), (0., 0.)])
+    led = gen.feature_ledger(clipped, sq)
+    check(led["recall"] < 0.99 and abs(led["recall"] - 0.75) < 0.1,
+          "ledger: clipping one square corner drops recall to ~3/4")
+
+    tooth = np.array([(0., 0.), (.4, 0.), (.4, .15), (.5, .15), (.5, 0.),
+                      (1., 0.), (1., 1.), (0., 1.), (0., 0.)])
+    led = gen.feature_ledger(tooth, sq)
+    check(led["recall"] > 0.99, "ledger: a comb tooth does not hurt recall")
+    check(led["precision"] < 0.75,
+          "ledger: a comb tooth's invented corners drop precision")
+
+    t = np.linspace(0, 2 * np.pi, 200)
+    circle = np.column_stack([0.5 + 0.4 * np.cos(t), 0.5 + 0.4 * np.sin(t)])
+    led = gen.feature_ledger(circle, circle)
+    check(led["recall"] > 0.99 and led["n_template"] == 0,
+          "ledger: corner-free template is a vacuous pass, not a fail")
 
 
 if __name__ == "__main__":

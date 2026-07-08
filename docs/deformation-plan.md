@@ -157,12 +157,27 @@ canonical orientation, not north-up.
    resolution, template demand), not sub-block alignment. Consistent with every
    other measured result: resolution (+0.10 IoU) and template demand (RDP) moved
    the picture; sub-block cleverness did not.
-2. **v2 — corridor-scale ARAP (the version with leverage):** raise the pull far
-   beyond the sub-block regime so limbs can relocate onto *different* streets,
-   governed by the **identity budget** `E_identity ≤ B` so the figure cannot
-   dissolve; add self-intersection guards for thin limbs. This is where the
-   registration idea stops duplicating the router and starts doing something the
-   router cannot: block-level re-draping of the figure onto the fabric.
+2. **v2 — corridor-scale ARAP with the identity budget — DONE, ships
+   default-ON.** Pull raised to the corridor regime (`bend_pull=6`), metered by
+   the budget exactly as specified: annealing stops the moment feature-ledger
+   recall vs the unbent template drops below `bend_min_recall` (0.85) or the
+   loop stops being simple (LinearRing check — a thin limb must not fold
+   through itself), reverting to the last within-budget state. The guard was
+   observed working: the Shark's annealing halted at recall 0.86.
+
+   Chicago A/B @ r2400 (OFF → ON): **star is the clear win** — ledger recall
+   0.47→0.73, turning 0.92→0.84, and visually five crisp symmetric arms where
+   OFF had a broken one; Shark turning 1.16→0.99 at IoU +0.01 (recall −0.11,
+   the budget spent near its floor); Horse ledger up at IoU −0.01; Knight ties.
+   IoU is flat everywhere — as expected, since what moves is *identity*, which
+   the ledger sees and IoU doesn't (star OFF: IoU 0.43 yet recall 0.47 — half
+   the points' corners were gone and IoU didn't care). Eyeball and ledger agree
+   ON is never worse and sometimes clearly better, so per the "at all cost"
+   goal it ships ON; `bend_template=False` restores main's behaviour exactly.
+
+   The render also shows the intended architecture working: the route now
+   closely follows the bent target — the deformation stage decides the drawing,
+   the router renders it, and the ledger meters what the deformation spent.
 3. Evaluate **schematization (#4)** as the discrete alternative if v2's soft
    attraction proves hard to control.
 4. Calibrate everything against the human-verdict set

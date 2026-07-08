@@ -32,7 +32,7 @@ import numpy as np
 import cv2
 import skia
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString
+from shapely.geometry import LinearRing, LineString
 
 # osmnx (live OSM fetch) and matplotlib (plotting) are imported lazily inside the
 # functions that need them -- build_grid and plot* -- so that callers which only
@@ -670,6 +670,9 @@ def bend_template(placed, grid, cfg):
                          proj - pts[:, None, :])
         return proj[np.arange(len(pts)), np.argmin(dist, axis=1)]
 
+    ref_closed = np.vstack([ref, ref[:1]])
+    guard = cfg.get("bend_min_recall", 0.85)
+    kept = P.copy()
     for it in range(outers):
         lam = lam_final * (it + 1) / outers          # stiffness annealing
         Q = attract(P)                               # attraction targets
@@ -694,6 +697,22 @@ def bend_template(placed, grid, cfg):
             T = np.column_stack([np.roll(tx, 1) - tx, np.roll(ty, 1) - ty])
             # Global: (L + lam I) P = T + lam Q, one solve per coordinate.
             P = np.linalg.solve(A, T + lam * Q)
+        # Identity budget: anneal only while every defining corner survives
+        # (feature-ledger recall vs the unbent template) and the loop stays
+        # simple (a thin limb must not fold through itself). On violation,
+        # revert to the last within-budget state and stop pulling -- "at all
+        # cost" never means past the point where the figure stops being itself.
+        if guard:
+            ok = feature_ledger(np.vstack([P, P[:1]]), ref_closed)["recall"] >= guard
+            if ok:
+                try:
+                    ok = LinearRing(P).is_simple
+                except Exception:
+                    pass
+            if not ok:
+                P = kept
+                break
+            kept = P.copy()
     return np.vstack([P, P[:1]])
 
 
@@ -1554,6 +1573,108 @@ def turning_distance(route, contour, samples=180):
     return best
 
 
+def _macro_corners(poly, max_vertices=28, min_turn_deg=25.0):
+    """Significant corners of a closed polyline: (positions, signed turns).
+
+    RDP first (kills staircase jitter, keeps macro structure), then keep the
+    vertices whose turning exceeds `min_turn_deg`. These are the features that
+    carry a figure's identity -- the exact objects the feature ledger audits.
+    """
+    p = simplify_template(_close(np.asarray(poly, dtype=np.float64)), max_vertices)
+    q = p[:-1]
+    if len(q) < 3:
+        return np.zeros((0, 2)), np.zeros(0)
+    e = np.roll(q, -1, axis=0) - q                    # edge i: q_i -> q_{i+1}
+    ang = np.arctan2(e[:, 1], e[:, 0])
+    turn = (ang - np.roll(ang, 1) + np.pi) % (2 * np.pi) - np.pi   # at vertex i
+    keep = np.abs(turn) >= np.radians(min_turn_deg)
+    return q[keep], turn[keep]
+
+
+def feature_ledger(route, placed, pos_tol=0.08, ang_tol_deg=40.0):
+    """Audit the identity-carrying corners: recall / precision / angle error.
+
+    The adherence metrics (IoU/Frechet) cannot see identity: a knight whose
+    snout notch vanishes loses ~0.03 IoU while turning into a blob. This metric
+    asks the question the eye asks -- does every defining corner of the template
+    have a counterpart in the route, and is every macro-corner of the route a
+    real feature rather than an invented one?
+
+      * both curves are reduced to macro-corners (_macro_corners);
+      * corners are matched with a cyclic ORDER-PRESERVING assignment (DP over
+        all start offsets and both windings; skips allowed at a fixed penalty,
+        matches only between same-sign turns -- a notch can't match a bump);
+      * a match is GOOD when position error <= pos_tol x template extent and
+        turn-angle error <= ang_tol_deg;
+      * recall    = turn-magnitude-weighted fraction of template corners with a
+                    good match (a lost 90 deg snout costs more than a lost
+                    25 deg bump);
+      * precision = fraction of route macro-corners that are good matches
+                    (comb teeth and invented zigzags fail this, attributably);
+      * angle_err_deg = mean turn error over good matches.
+
+    Returns dict(recall, precision, f1, angle_err_deg, n_template, n_route).
+    """
+    P, tP = _macro_corners(placed)
+    R0, tR0 = _macro_corners(route)
+    if len(P) == 0:
+        # Corner-free template (a circle): the ledger is vacuous -- there are
+        # no defining corners to lose, so it passes and other metrics judge.
+        return dict(recall=1.0, precision=1.0, f1=1.0, angle_err_deg=0.0,
+                    n_template=0, n_route=len(R0))
+    out = dict(recall=0.0, precision=1.0, f1=0.0, angle_err_deg=180.0,
+               n_template=len(P), n_route=len(R0))
+    if len(R0) == 0:
+        return out                       # corners existed and ALL are missing
+    extent = float(max(np.ptp(np.asarray(placed, np.float64)[:, 0]),
+                       np.ptp(np.asarray(placed, np.float64)[:, 1]))) or 1.0
+    skip, cap = 0.30, 0.60
+    ang_tol = np.radians(ang_tol_deg)
+    best = None                                        # (total_cost, pairs, R, tR)
+    for R, tR in ((R0, tR0), (R0[::-1].copy(), -tR0[::-1].copy())):
+        posd = np.linalg.norm(P[:, None, :] - R[None, :, :], axis=2) / extent
+        angd = np.abs(tP[:, None] - tR[None, :])
+        cost = posd + 0.5 * angd / np.pi
+        cost[np.sign(tP)[:, None] != np.sign(tR)[None, :]] = np.inf
+        cost[cost > cap] = np.inf
+        n, m = len(P), len(R)
+        for r in range(m):                             # cyclic start offsets of R
+            c = np.roll(cost, -r, axis=1)
+            dp = np.full((n + 1, m + 1), np.inf)
+            dp[0, :] = np.arange(m + 1) * skip
+            dp[:, 0] = np.arange(n + 1) * skip
+            back = np.zeros((n + 1, m + 1), dtype=np.int8)
+            for i in range(1, n + 1):
+                for j in range(1, m + 1):
+                    a = dp[i - 1, j] + skip            # skip template corner
+                    b = dp[i, j - 1] + skip            # skip route corner
+                    d = dp[i - 1, j - 1] + c[i - 1, j - 1]
+                    dp[i, j], back[i, j] = min((d, 2), (a, 0), (b, 1))
+            if best is None or dp[n, m] < best[0]:
+                pairs, i, j = [], n, m
+                while i > 0 and j > 0:
+                    k = back[i, j]
+                    if k == 2:
+                        pairs.append((i - 1, (j - 1 + r) % m))
+                        i, j = i - 1, j - 1
+                    elif k == 0:
+                        i -= 1
+                    else:
+                        j -= 1
+                best = (float(dp[n, m]), pairs, posd, angd)
+    _, pairs, posd, angd = best
+    good = [(i, j) for i, j in pairs
+            if posd[i, j] <= pos_tol and angd[i, j] <= ang_tol]
+    w = np.abs(tP)
+    out["recall"] = float(sum(w[i] for i, _ in good) / w.sum()) if w.sum() else 0.0
+    out["precision"] = len(good) / len(R0)
+    if good:
+        out["angle_err_deg"] = float(np.degrees(np.mean([angd[i, j] for i, j in good])))
+    r_, p_ = out["recall"], out["precision"]
+    out["f1"] = 2 * r_ * p_ / (r_ + p_) if (r_ + p_) > 0 else 0.0
+    return out
+
+
 def perceptual_cost(route, placed, res=128, blur=4.0):
     """Holistic, blur-tolerant shape distance via low-res render-and-compare.
 
@@ -1849,14 +1970,17 @@ CONFIG = dict(
     # deviation router + cleanup already absorb sub-block mismatch, so a
     # half-block pre-alignment doesn't change which streets are chosen. The
     # lever only matters at corridor scale (bending a limb onto a DIFFERENT
-    # street), which needs a much stronger pull governed by an identity budget
-    # -- the v2 in docs/deformation-plan.md. bend_pull is the final attraction
-    # strength (annealed over bend_iters); bend_spacing is the working
-    # resolution in avg-edges.
-    bend_template=False,
-    bend_pull=1.5,
+    # street), which is what the v2 defaults below attempt: a much stronger
+    # pull, metered by the identity budget -- annealing stops the moment
+    # feature-ledger recall vs the unbent template drops below bend_min_recall
+    # or the loop stops being simple (a limb folding through itself). bend_pull
+    # is the final attraction strength (annealed over bend_iters);
+    # bend_spacing is the working resolution in avg-edges.
+    bend_template=True,
+    bend_pull=6.0,
     bend_iters=8,
     bend_spacing=0.75,
+    bend_min_recall=0.85,
 
     # Routing / fidelity.
     deviation_weight=60.0,    # >> 1 makes "stay on the outline" dominate cost
