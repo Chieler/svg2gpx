@@ -599,19 +599,25 @@ def fourier_lowpass(pts, harmonics, samples=512):
 def maybe_lowpass_contour(contour, cfg):
     """Apply the Fourier low-pass when enabled AND the corner gate allows it.
 
-    Two-part gate, both on the outline's total absolute turning:
+    Three-part gate:
 
-      * it must have detail worth removing -- turning above `fd_detail_turns` x
-        2*pi (a convex loop is exactly 2*pi; a smooth circle/donut sits near it
-        even from raster, so low-passing them only shuffles the placement and
-        can't help), and
+      * detail worth removing -- turning above `fd_detail_turns` x 2*pi (a convex
+        loop is exactly 2*pi; a smooth circle/donut sits near it even from raster,
+        so low-passing them only shuffles the placement and can't help);
       * the low-pass must *smooth* it -- cut turning by at least `fd_min_turn_drop`.
-        An organic shape sheds raster jaggies and sub-block wiggle (turning drops
-        a lot); a shape of straight edges meeting sharp corners (a square, an L)
-        instead rings (Gibbs) and turning *rises*, so those keep their crisp
-        target. This separates the families where a corner-displacement test
-        cannot -- a star's tips and a horse's legs move alike, but only the
-        former rings.
+        A shape of straight edges meeting sharp corners (a square, an L) instead
+        rings (Gibbs) and turning *rises*, so those keep their crisp target; and
+      * the low-pass must substantially reshape the *silhouette* --
+        `perceptual_cost(lp, contour) >= fd_min_silhouette_change`. This is the
+        elongation gate, learned from a real-Chicago per-family A/B: low-pass
+        de-jags long thin structure (a horse's legs, a shark's body, a star's
+        arms), which -- being area-sensitive -- moves the filled silhouette a lot
+        AND is where the router was combing worst, so it helps. A compact,
+        feature-defined shape (a knight, a pawn, a crow) barely changes in
+        silhouette, so the low-pass isn't removing combable detail, it is only
+        rounding the one notch that gives the shape its identity -> it hurts.
+        The blur-tolerant perceptual measure separates these where turning,
+        aspect, corner-shift and residual-localization all overlap.
     """
     if not cfg.get("fd_lowpass", False):
         return contour
@@ -621,7 +627,8 @@ def maybe_lowpass_contour(contour, cfg):
     lp_turn = _total_abs_turning(resample(lp, n=400))
     has_detail = raw_turn > cfg.get("fd_detail_turns", 3.0) * 2.0 * np.pi
     smooths = lp_turn <= (1.0 - cfg.get("fd_min_turn_drop", 0.15)) * raw_turn
-    return lp if (has_detail and smooths) else contour
+    reshapes = perceptual_cost(lp, contour) >= cfg.get("fd_min_silhouette_change", 0.011)
+    return lp if (has_detail and smooths and reshapes) else contour
 
 
 # --------------------------------------------------------------------------- #
@@ -2212,9 +2219,13 @@ CONFIG = dict(
     # smooths (not sharp shapes it would ring, nor already-smooth ones it can't
     # help). See docs/routing-fidelity-plan.md and docs/rendering-fidelity-plan.md.
     fd_lowpass=True,
-    fd_harmonics=20,          # grid Nyquist ~ blocks-per-shape / 2
-    fd_detail_turns=3.0,      # only shapes whose turning exceeds this x 2*pi
-    fd_min_turn_drop=0.15,    # and that the low-pass smooths by >= this fraction
+    fd_harmonics=20,              # grid Nyquist ~ blocks-per-shape / 2
+    fd_detail_turns=3.0,          # only shapes whose turning exceeds this x 2*pi
+    fd_min_turn_drop=0.15,        # that the low-pass smooths by >= this fraction
+    fd_min_silhouette_change=0.011,  # AND whose silhouette it reshapes >= this
+                                  # (elongation gate: skips compact feature-rich
+                                  #  shapes the low-pass would round into mush --
+                                  #  learned from the real-Chicago per-family A/B)
 
     # Granularity: 0.0 = smooth, fewer steps, shorter and easier to run;
     #              1.0 = trace every jog of the shape, longer and more expressive.

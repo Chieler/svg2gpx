@@ -9,9 +9,10 @@ lowers the *demand* for combing, the changes here lower the *supply*.
 **Status: Phase 0–4 implemented. Grid-independent wins (default-ON): Phase 0
 (the `excess` metric) and the Phase-3 Hausdorff fix. Situational knobs: the
 Phase-2 turn penalty and Phase-3 trellis (default-OFF), and the Phase-4 Fourier
-low-pass (currently default-ON on the strength of the synthetic benchmark, but a
-real-grid check shows the win does NOT transfer to Chicago — see the caveat under
-Phase 4; the default is an open call leaning OFF).**
+low-pass (default-ON, now with an **elongation-aware gate** — a real-grid
+per-family check showed it was rounding compact shapes into blobs, so it now fires
+only on long-edged shapes and is a no-op on compact ones, byte-identical to the
+sharp engine there).**
 
 ## Diagnosis (measured on the synthetic 50×50 lattice, all bundled shapes)
 
@@ -201,13 +202,16 @@ reconstructs; `maybe_lowpass_contour` applies it at the top of `search_placement
 so the router traces a grid-renderable shape instead of chasing sub-block detail
 it can only staircase. See [`fd-lowpass-gate.png`](fd-lowpass-gate.png).
 
-The gate is two-part, both on the outline's total absolute turning: (1) it must
-have detail worth removing — turning above `fd_detail_turns`·2π (a smooth
-circle/donut sits near 2π even from raster, so low-passing it only reshuffles the
-placement); (2) the low-pass must *smooth* it — cut turning by ≥ `fd_min_turn_drop`.
-A square/L of straight edges meeting sharp corners **rings** (Gibbs) and its
-turning *rises*, so it is skipped and keeps its crisp target. This separates the
-families a corner-displacement test could not (a star's tips and a horse's legs
+The gate is **three-part**. Two on total absolute turning: (1) detail worth
+removing — turning above `fd_detail_turns`·2π (a smooth circle/donut sits near 2π
+even from raster, so low-passing it only reshuffles the placement); (2) the
+low-pass must *smooth* it — cut turning by ≥ `fd_min_turn_drop` (a square/L of
+straight edges meeting sharp corners **rings** (Gibbs) and its turning *rises*, so
+it is skipped and keeps its crisp target). The third, added after the real-grid
+check below, is the **elongation gate**: the low-pass must reshape the *silhouette*
+by ≥ `fd_min_silhouette_change` (`perceptual_cost(lp, contour)`). See the resolution
+note under the caveat. This first pair already separates the families a
+corner-displacement test could not (a star's tips and a horse's legs
 move alike, but only the former rings). Applied to Crow/Horse/Knight/Pawn/Shark/
 star; skipped on Cat/circle/donut/face/lshape/square (all byte-identical).
 
@@ -261,6 +265,32 @@ built on. Default-ON (`fd_lowpass=True`), gated; set `fd_lowpass=False` to disab
 > Knight/Pawn/Crow**. The fix is an **elongation-aware gate** (apply FD only where
 > long edges dominate — high aspect / long straight runs — skip compact
 > feature-rich shapes), which would make FD default-ON fire only where it helps.
+
+> **✅ Resolution — the elongation gate (implemented,
+> [`chicago_maps/fd_elongation_gate_chicago.png`](../chicago_maps/fd_elongation_gate_chicago.png)).**
+> A clean geometric separator was *not* obvious: aspect ratio, straight-edge
+> fraction, corner-displacement, form-change (turning/IoU of lp-vs-original) and
+> residual-localization all **overlap** between the families (Shark's body is as
+> "un-straight" as Knight's). The one measure that separates them is the
+> **blur-tolerant perceptual change** `perceptual_cost(lp, contour)`: FD helps
+> ⇒ 0.013–0.037 (Horse/Shark/star), FD hurts ⇒ 0.004–0.009 (Knight/Pawn/Crow), a
+> real gap at ~0.011. Rationale: long thin structure (legs/arms/points) is
+> area-sensitive, so the low-pass moves the filled silhouette a lot — and those
+> are exactly the shapes the router was combing worst; a compact shape barely
+> changes in silhouette, so the low-pass isn't removing combable detail, only
+> rounding the one notch that gives the shape its identity. Added as the third
+> gate condition (`fd_min_silhouette_change`, default 0.011). Result: FD now
+> **applies to Horse/Shark/star and skips Cat/Crow/Knight/Pawn/circle/donut/face/
+> lshape/square** — so the compact shapes are byte-identical to the sharp engine
+> on Chicago (Knight reads as a knight again, not a blob), while the long-edged
+> shapes keep the de-jag. This makes **`fd_lowpass` default-ON defensible**: it
+> only fires where it helps and is a no-op everywhere it hurt. Cost: the synthetic
+> benchmark gives back a little (Frechet 0.0338→0.0353, still < 0.0376 baseline)
+> because the synthetic grid *liked* FD on Knight/Pawn where the real grid hated
+> it — the right trade, since the real grid is the use case. Honest caveat: the
+> gate threshold is calibrated on the bundled shapes (n≈6, noisy real-grid ground
+> truth); Horse remains the one applied shape whose real-grid benefit is
+> placement-noisy rather than proven.
 
 **Re-test of the router knobs on the low-passed target (measured).** The
 hypothesis was that `turn_weight` / `trellis` were penalized for corner-rounding

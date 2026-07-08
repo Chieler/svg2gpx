@@ -148,8 +148,10 @@ def fd_lowpass_checks():
         gen.maybe_lowpass_contour(
             np.asarray(gen.extract_contour(f"shapes/{s}.svg", 512), dtype=float), cfg),
         np.asarray(gen.extract_contour(f"shapes/{s}.svg", 512), dtype=float))
-    check(fires("Horse"), "gate applies the low-pass to an organic shape (horse)")
+    check(fires("Horse"), "gate applies the low-pass to a long-edged shape (horse)")
     check(not fires("square"), "gate skips the low-pass on a sharp shape (square rings)")
+    check(not fires("Knight"), "elongation gate skips a compact feature-rich shape "
+          "(knight -- low-pass would round it into a blob)")
 
 
 def trellis_checks():
