@@ -932,7 +932,18 @@ def search_placement(contour, grid, cfg, inners=None):
         return (_score(cand, grid, scale, cfg, importance, fp, feat_w, feat_share),
                 (scale, rot, dx, dy, aspect, shear, flip))
 
-    results = [trial(rng.uniform(s_lo, s_hi), rng.uniform(0, 360),
+    # Orientation prior: figurative shapes have a canonical orientation (a shark
+    # swims horizontally; a 90 deg-rotated one stops reading as a shark even at
+    # perfect overlap -- and no overlap metric notices). rot_max caps placement
+    # rotation around the drawn orientation; None = free spin (abstract shapes).
+    rot_max = cfg.get("rot_max")
+    def rrot():
+        return (rng.uniform(-rot_max, rot_max) if rot_max is not None
+                else rng.uniform(0, 360))
+    def rclamp(r):
+        return float(np.clip(r, -rot_max, rot_max)) if rot_max is not None else r
+
+    results = [trial(rng.uniform(s_lo, s_hi), rrot(),
                      rng.uniform(-lim, lim), rng.uniform(-lim, lim),
                      float(np.exp(rng.uniform(-ln_a, ln_a))), rng.uniform(-shm, shm),
                      rflip())
@@ -943,7 +954,7 @@ def search_placement(contour, grid, cfg, inners=None):
         _, (s, r, dx, dy, asp, sh, fl) = results[rng.integers(0, min(8, len(results)))]
         results.append(trial(
             float(np.clip(s + rng.normal(0, 0.04), s_lo, s_hi)),
-            r + rng.normal(0, 6),
+            rclamp(r + rng.normal(0, 6)),
             dx + rng.normal(0, 0.03),
             dy + rng.normal(0, 0.03),
             float(np.clip(asp * np.exp(rng.normal(0, 0.05)), 1 / cfg["aspect_max"], cfg["aspect_max"])),
@@ -1698,6 +1709,13 @@ CONFIG = dict(
     # original Manhattan-blocks rationale for the wide caps).
     aspect_max=1.15,          # max area-preserving stretch (1.0 = uniform scale)
     shear_max=0.05,           # max skew, for non-orthogonal grids
+    # Orientation is identity too: a 90 deg-rotated shark stops reading as a
+    # shark at perfect overlap, and no overlap metric notices (this exact
+    # failure selected a vertical Shark on Chicago). Cap rotation around the
+    # drawn orientation; reflect still allows facing either way. +/-35 deg
+    # nearly covers a 72-90 deg symmetry period, so star/square lose little
+    # seating freedom. None = free spin (orientation-free abstract shapes).
+    rot_max=35.0,
     reflect=True,             # also search mirror-image placements (a shark faces
                               #   either way): doubles the orientations available to
                               #   line the outline up with the streets
