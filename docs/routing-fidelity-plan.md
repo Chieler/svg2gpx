@@ -6,10 +6,12 @@ layers. This is the counterpart to [`rendering-fidelity-plan.md`](rendering-fide
 which attacks the same artifact from the *input* side (Fourier low-pass matches
 the target's detail to the grid's Nyquist). The two are complementary: low-pass
 lowers the *demand* for combing, the changes here lower the *supply*.
-**Status: Phase 0–4 implemented. Default-ON: Phase 0 (metric), the Phase-3
-Hausdorff fix, and Phase 4 (Fourier low-pass — the clean win, 6/7 metrics up).
-Default-OFF knobs (neither a clean win on its own): the Phase-2 turn penalty and
-the Phase-3 trellis — both worth re-testing on the low-passed target.**
+**Status: Phase 0–4 implemented. Grid-independent wins (default-ON): Phase 0
+(the `excess` metric) and the Phase-3 Hausdorff fix. Situational knobs: the
+Phase-2 turn penalty and Phase-3 trellis (default-OFF), and the Phase-4 Fourier
+low-pass (currently default-ON on the strength of the synthetic benchmark, but a
+real-grid check shows the win does NOT transfer to Chicago — see the caveat under
+Phase 4; the default is an open call leaning OFF).**
 
 ## Diagnosis (measured on the synthetic 50×50 lattice, all bundled shapes)
 
@@ -222,6 +224,27 @@ form-metric `turning` (↓20%); the gate + the figure confirm the smoothed targe
 still reads as the shape. Why this wins where the router knobs didn't: it changes
 the *input*, never a cost the search optimizes — the discipline the whole plan is
 built on. Default-ON (`fd_lowpass=True`), gated; set `fd_lowpass=False` to disable.
+
+> **⚠️ Real-grid caveat (measured on the cached Chicago snapshot, Logan Square —
+> [`chicago_maps/fd_lowpass_chicago_fullpipeline.png`](../chicago_maps/fd_lowpass_chicago_fullpipeline.png)).**
+> The synthetic-grid win **does not transfer to real streets.** Same-placement
+> (isolating routing) barely moves anything — Shark combing 52.0→52.0, Knight
+> 92.5→92.5 — so the plan's dramatic same-placement numbers do not reproduce here.
+> Full pipeline (each does its own placement search) is mixed to net-negative:
+> Crow improves (IoU 0.38→0.43, turning 1.16→0.67, the spurious spike gone), but
+> Horse (IoU 0.37→0.30) and Knight (0.38→0.30) *regress*, Shark is lateral. The
+> low-pass's real effect is to change *which placement wins*, and on irregular
+> real streets (diagonals, varying block size) that is a coin-flip, not the
+> consistent improvement a uniform lattice gives. The synthetic benchmark
+> over-stated this lever; its benefit was mostly the placement-search reseating
+> that a uniform grid rewards. The honest conclusion: the **`excess` metric and
+> the Hausdorff fix are the grid-independent wins; every rendering/routing lever
+> (turn penalty, trellis, FD low-pass) is a situational knob, not a clean
+> default.** Whether `fd_lowpass` should stay default-ON (synthetic-CI win) or
+> flip to default-OFF (real-grid is the use case) is an open call; the evidence
+> leans OFF. n=4 and the comparison is confounded (different placements/targets),
+> so a wider real-grid sweep — and deriving `fd_harmonics` from the real
+> blocks-per-shape rather than a fixed 20 — should precede a firm default.
 
 **Re-test of the router knobs on the low-passed target (measured).** The
 hypothesis was that `turn_weight` / `trellis` were penalized for corner-rounding
