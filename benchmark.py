@@ -39,6 +39,7 @@ import gen
 from gen import (
     Grid,
     dtw,
+    excess_turning,
     extract_contour,
     format_distance,
     frechet,
@@ -157,7 +158,8 @@ def run_case(grid, case, cfg):
         return {"name": case["name"], "nodes": len(route), "cost": cost,
                 "frechet": float("nan"), "hausdorff": float("nan"), "iou": 0.0,
                 "perceptual": float("nan"), "dtw": float("nan"),
-                "turning": float("nan"), "on_land": 0.0, "length_m": 0.0,
+                "turning": float("nan"), "excess": float("nan"),
+                "on_land": 0.0, "length_m": 0.0,
                 "t_contour": t_contour, "t_search": t_search}
 
     return {
@@ -170,6 +172,7 @@ def run_case(grid, case, cfg):
         "perceptual": perceptual_cost(route, placed),
         "dtw": dtw(route, placed),
         "turning": turning_distance(route, placed),
+        "excess": excess_turning(route, placed),
         "on_land": land_fraction(placed, grid) * 100.0,
         "length_m": route_length_m(route, grid),
         "t_contour": t_contour,
@@ -188,6 +191,7 @@ COLUMNS = [
     ("perceptual", "percept", 8, lambda v: f"{v:>8.4f}"),
     ("dtw", "DTW", 8, lambda v: f"{v:>8.4f}"),
     ("turning", "turning", 8, lambda v: f"{v:>8.4f}"),
+    ("excess", "excess", 8, lambda v: f"{v:>8.3f}"),
     ("cost", "cost", 8, lambda v: f"{v:>8.4f}"),
     ("on_land", "land%", 6, lambda v: f"{v:>6.0f}"),
     ("length_m", "dist", 16, lambda v: f"{v:>16}"),
@@ -224,12 +228,12 @@ def _print_summary(results):
           f"Frechet={mean('frechet'):.4f}  Hausdorff={mean('hausdorff'):.4f}  "
           f"IoU={mean('iou'):.3f}  perceptual={mean('perceptual'):.4f}  "
           f"DTW={mean('dtw'):.4f}  turning={mean('turning'):.4f}  "
-          f"t_route={mean('t_search'):.2f}s")
+          f"excess={mean('excess'):.3f}  t_route={mean('t_search'):.2f}s")
 
 
 def write_csv(results, path):
     fields = ["name", "nodes", "frechet", "hausdorff", "iou", "perceptual",
-              "dtw", "turning", "cost", "on_land", "length_m",
+              "dtw", "turning", "excess", "cost", "on_land", "length_m",
               "t_contour", "t_search"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)

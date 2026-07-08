@@ -14,6 +14,43 @@ from gen import Grid, route_contour, route_pair, search_placement
 from benchmark import synthetic_grid
 
 
+def dissolve_checks():
+    """dissolve_oscillations collapses a doubling-back comb tooth but leaves a
+    monotone staircase alone, and always emits a connected walk."""
+    cfg = dict(gen.CONFIG)
+    cfg.update(grid_size=41, grid_diagonals=True)
+    grid = synthetic_grid(cfg)
+    s = 1.0 / 40
+    node = lambda i, j: (round(i * s, 6), round(j * s, 6))
+
+    # A comb tooth: run along row 20, poking up to row 21 and back (doubles back).
+    row = 20
+    tooth = []
+    for i in range(10, 21):
+        tooth.append(node(i, row))
+        if i % 2 == 0:
+            tooth += [node(i, row + 1), node(i, row)]
+    outline = np.array([node(i, row) for i in np.linspace(10, 20, 60).astype(int)],
+                       dtype=np.float64)
+    out = gen.dissolve_oscillations(grid, tooth, cKDTree(outline), cfg)
+    check(len(out) < len(tooth), "dissolve collapses a doubling-back comb tooth")
+    check(is_connected_walk(out, grid.graph),
+          "dissolve output is a connected walk on real edges")
+
+    # A monotone shallow staircase (slope ~1:4): the faithful grid rendering of a
+    # shallow straight edge -- its shortest-path bypass is the same length, so it
+    # must survive untouched.
+    stair, x, y = [], 4, 20
+    for k in range(24):
+        stair.append(node(x, y)); x += 1
+        if k % 4 == 3:
+            y += 1
+    stair_ct = cKDTree(np.array(stair, dtype=np.float64))
+    kept = gen.dissolve_oscillations(grid, stair, stair_ct, cfg)
+    check(len(kept) == len(stair),
+          "dissolve preserves a faithful shallow staircase (no corner-cutting)")
+
+
 def check(cond, msg):
     assert cond, msg
     print(f"  ok: {msg}")
@@ -89,6 +126,8 @@ def main():
     check(is_connected_walk(cand.route, lattice.graph),
           "pipeline smoke: star route is a connected walk")
     check(cand.route[0] == cand.route[-1], "pipeline smoke: star route is closed")
+
+    dissolve_checks()
 
     print("\nall routing checks passed")
 

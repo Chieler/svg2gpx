@@ -1206,6 +1206,64 @@ def shortcut_nooks(grid, route, contour_tree, weight, window, slack):
     return out
 
 
+def dissolve_oscillations(grid, route, contour_tree, cfg):
+    """Collapse high-frequency comb teeth into a monotone line.
+
+    shortcut_nooks smooths by a granularity-tied slack budget and only when the
+    replacement is shorter, so it *preserves* a comb tooth whose vertices happen
+    to hug the outline (an anchor snapped into a side nook the outline dips
+    toward). This pass keys on the route's own turn signature instead: a run of
+    rapidly *alternating-sign, sharp* turns is a comb artifact. Each run is
+    bypassed with the plain shortest path (no contour bias -- so it straightens
+    rather than re-tracing the tooth), and the bypass is taken only when it is
+
+      * materially SHORTER than the arc it replaces -- the tooth doubled back.
+        A legitimate diagonal staircase alternates turn sign too, but on a grid
+        its shortest-path bypass is the *same* length, so it is left alone; and
+      * within a HARD deviation cap (`protrusion_tolerance` avg-edges, the same
+        threshold the rest of cleanup uses) -- a real beak/leg run out-and-back
+        strays past the cap when cut, so genuine protrusions survive.
+
+    Trades a sliver of interior fidelity for a clean line where -- and only
+    where -- the route is visibly oscillating.
+    """
+    hard = grid.avg_edge * cfg["protrusion_tolerance"]
+    min_turn = np.radians(cfg.get("oscillation_turn_deg", 30.0))
+    min_gain = cfg.get("oscillation_min_gain", 0.15)     # bypass must be >=15% shorter
+    out = list(route)
+    for _ in range(len(out)):                            # bounded fixed-point
+        p = np.asarray(out, dtype=np.float64)
+        n = len(p)
+        if n < 5:
+            break
+        v = np.diff(p, axis=0)
+        ang = np.arctan2(v[:, 1], v[:, 0])
+        turn = (np.diff(ang) + np.pi) % (2 * np.pi) - np.pi   # turn[k] at vertex k+1
+        k, collapsed = 0, False
+        while k < len(turn) - 1:
+            if (abs(turn[k]) >= min_turn and abs(turn[k + 1]) >= min_turn
+                    and np.sign(turn[k]) != np.sign(turn[k + 1])):
+                m = k + 1                                 # extend the alternating run
+                while (m < len(turn) and abs(turn[m]) >= min_turn
+                       and np.sign(turn[m]) != np.sign(turn[m - 1])):
+                    m += 1
+                lo, hi = k, min(m + 1, n - 1)             # shoulders around the run
+                arc = out[lo:hi + 1]
+                alt = route_pair(grid.graph, out[lo], out[hi], np.asarray(arc), 0.0)
+                if (2 <= len(alt) < len(arc)
+                        and _arc_len(alt) <= (1.0 - min_gain) * _arc_len(arc)
+                        and _deviations(alt, contour_tree).max(initial=0.0) <= hard):
+                    out = out[:lo] + alt + out[hi + 1:]
+                    collapsed = True
+                    break
+                k = m
+            else:
+                k += 1
+        if not collapsed:
+            break
+    return out
+
+
 def cleanup(grid, route, dense, wp_idx, weight, cfg, close=True):
     """Close the loop, then strip artifacts while protecting real protrusions.
 
@@ -1227,11 +1285,14 @@ def cleanup(grid, route, dense, wp_idx, weight, cfg, close=True):
     closed = route[0] == route[-1]
     body = route[:-1] if closed else route          # protect the closure seam
     max_arc = max(4, len(body) // 4)
+    dissolve = cfg.get("dissolve_oscillations", True)
     for _ in range(3):                              # passes reach a fixed point
         before = len(body)
         body = remove_backtracks(body, contour_tree, tol)
         body = collapse_loops(body, max_arc, contour_tree, tol)
         body = shortcut_nooks(grid, body, contour_tree, weight, window, slack)
+        if dissolve:
+            body = dissolve_oscillations(grid, body, contour_tree, cfg)
         if len(body) == before:
             break
     return body + [body[0]] if closed else body
@@ -1391,6 +1452,49 @@ def turning_distance(route, contour, samples=180):
         diff -= diff.mean(axis=1, keepdims=True)  # remove constant rotation offset
         best = min(best, float(np.sqrt((diff ** 2).mean(axis=1).min())))
     return best
+
+
+def _total_abs_turning(pts):
+    """Sum of |turn angle| over a closed polyline's own vertices (radians).
+
+    Consecutive-duplicate and closing points are dropped so collinear runs of
+    densified nodes contribute nothing; only real direction changes count. A
+    convex loop totals ~2*pi; each extra out-and-back comb tooth or staircase
+    step adds roughly twice its turn.
+    """
+    p = np.asarray(pts, dtype=np.float64)
+    if len(p) >= 2 and np.allclose(p[0], p[-1]):
+        p = p[:-1]                                   # drop the closing duplicate
+    if len(p) > 1:                                   # drop consecutive duplicates
+        keep = np.concatenate([[True], np.any(np.abs(np.diff(p, axis=0)) > 1e-12, axis=1)])
+        p = p[keep]
+    if len(p) < 3:
+        return 0.0
+    v = np.diff(np.vstack([p, p[:1]]), axis=0)       # closed edge vectors
+    ang = np.arctan2(v[:, 1], v[:, 0])
+    turn = np.diff(np.concatenate([ang, ang[:1]]))
+    turn = (turn + np.pi) % (2 * np.pi) - np.pi      # wrap each turn to [-pi, pi]
+    return float(np.sum(np.abs(turn)))
+
+
+def excess_turning(route, contour, samples=360):
+    """Combing measure: the route's total absolute turning minus the target's.
+
+    Position metrics (Frechet, Hausdorff) barely see combing because the teeth
+    hug the outline; turning_distance sees it but conflates it with real form.
+    This isolates the artifact: how much *extra* winding the route does beyond
+    what the shape itself asks for. ~0 means the route bends exactly as much as
+    the shape; large positive means combing / staircase jitter. Lower is better.
+    (Search-independent, so it's a fair judge of anti-combing changes -- unlike
+    any cost the placement search or router already optimizes.)
+
+    The route is measured on its own vertices -- street nodes have no sub-block
+    noise, so every counted turn is a real direction change. The target is a
+    raster trace with thousands of pixel-scale jaggies, so it is resampled to
+    `samples` points first, smoothing that raster noise down to the shape's true
+    form winding before the subtraction.
+    """
+    return _total_abs_turning(route) - _total_abs_turning(resample(contour, n=samples))
 
 
 def perceptual_cost(route, placed, res=128, blur=4.0):
@@ -1684,6 +1788,17 @@ CONFIG = dict(
     # out-and-back / loop is treated as an artifact instead of a real protrusion
     # (beak, leg, tail). Higher = more forgiving of genuine thin features.
     protrusion_tolerance=2.5,
+
+    # Combing filter (dissolve_oscillations, a cleanup pass). Collapses runs of
+    # rapidly alternating sharp turns -- comb teeth -- into a monotone line when
+    # the straightened bypass is materially shorter (the tooth doubled back, vs a
+    # legitimate staircase which is not shortened) and stays within the
+    # protrusion_tolerance deviation cap. oscillation_turn_deg is how sharp a turn
+    # must be to count toward a run; oscillation_min_gain is the minimum length
+    # reduction (fraction) the bypass must achieve to fire.
+    dissolve_oscillations=True,
+    oscillation_turn_deg=30.0,
+    oscillation_min_gain=0.15,
 
     seed=42,
 )
