@@ -569,6 +569,38 @@ def waypoint_importance(pts, k=4):
     return imp / peak if peak > 0 else imp
 
 
+def simplify_template(contour, max_vertices):
+    """Corner-preserving simplification (RDP) of the closed template.
+
+    The contour is a *template*, not a constraint: at street resolution
+    (~25-60 blocks per shape) the identity of a figure lives in a couple of
+    dozen corners -- a knight's snout, a shark's fin -- while the raster trace
+    carries thousands of sub-block jitter points the router can only render as
+    staircase/comb. Douglas-Peucker keeps exactly the corners and discards
+    exactly the jitter (the opposite trade to spectral smoothing, which rounds
+    corners and was measured to destroy compact shapes' identity on the real
+    Chicago grid; see docs/recognizability-plan.md). Epsilon is binary-searched
+    to land at <= `max_vertices` vertices. Falsy `max_vertices` disables; a
+    template already that simple is returned unchanged.
+    """
+    contour = np.asarray(contour, dtype=np.float64)
+    if not max_vertices or len(contour) <= max_vertices + 1:
+        return contour
+    pts = (contour[:-1] * 4096.0).astype(np.int32).reshape(-1, 1, 2)
+    peri = cv2.arcLength(pts, True)
+    lo, hi, best = 1e-5, 0.2, None
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        ap = cv2.approxPolyDP(pts, mid * peri, True)
+        if len(ap) > max_vertices:
+            lo = mid
+        else:
+            best, hi = ap, mid
+    if best is None or len(best) < 3:
+        return contour
+    return _close(best.reshape(-1, 2).astype(np.float64) / 4096.0)
+
+
 # --------------------------------------------------------------------------- #
 # Placement search                                                            #
 # --------------------------------------------------------------------------- #
@@ -654,7 +686,8 @@ def build_route(grid, placed, cfg):
     if len(waypoints) < 3:
         return [], dense, waypoints
     w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w)
+    route = route_contour(grid, dense, waypoints, wp_idx, w,
+                          flat_frac=cfg.get("flat_deviation_frac", 1.0))
     route = cleanup(grid, route, dense, wp_idx, w, cfg)
     return route, dense, waypoints
 
@@ -863,6 +896,10 @@ def search_placement(contour, grid, cfg, inners=None):
     placement escapes it, so the caller presents several to choose from.
     """
     rng = np.random.default_rng(cfg["seed"])
+    # The contour is a template, not a constraint: reduce it to the corners
+    # that carry its identity before asking streets to draw it (no-op when
+    # template_vertices is falsy or the template is already that simple).
+    contour = simplify_template(contour, cfg.get("template_vertices"))
     base = resample(contour, n=250)          # cheap, transform-invariant proxy
     importance = waypoint_importance(base)   # which of those points define the shape
     s_lo, s_hi = cfg["scale_range"]
@@ -1096,7 +1133,7 @@ def route_pair(graph, src, dst, seg, weight, best_effort=False):
     return path[::-1]
 
 
-def route_contour(grid, dense, waypoints, wp_idx, weight):
+def route_contour(grid, dense, waypoints, wp_idx, weight, flat_frac=1.0):
     """Chain route_pair across all waypoints, sharing junction nodes.
 
     An unreachable waypoint (a disconnected pocket in the graph) doesn't break
@@ -1104,14 +1141,29 @@ def route_contour(grid, dense, waypoints, wp_idx, weight):
     the next leg continues from wherever the route actually ended -- so the
     result is always a connected walk on real edges, never a straight-line
     teleport that would be counted as if it were run.
+
+    flat_frac < 1 turns the constant hugging weight into a feature-hug profile:
+    each leg's deviation weight ramps with the local waypoint_importance of the
+    arc it traces -- full weight near defining corners (a beak tip must be hit
+    and turned at), down to flat_frac of it on featureless stretches, where
+    slavishly hugging the template's raster jitter is what produces staircase.
+    There the anchors alone (never more than max_gap apart) constrain the path
+    and the streets choose the clean line between them. This is the "template,
+    not constraint" reframe applied to the router: adhere at features, delegate
+    the in-between to the street fabric.
     """
+    imp = waypoint_importance(np.asarray(dense)) if flat_frac < 1.0 else None
     route, bridged = [], 0
     cur = waypoints[0]
     for i in range(1, len(waypoints)):
         seg = dense[wp_idx[i - 1]:wp_idx[i] + 1]
         if len(seg) < 2:
             seg = np.array([cur, waypoints[i]])
-        part = route_pair(grid.graph, cur, waypoints[i], seg, weight,
+        w = weight
+        if imp is not None and len(imp):
+            leg_imp = float(imp[wp_idx[i - 1]:wp_idx[i] + 1].max(initial=0.0))
+            w = weight * (flat_frac + (1.0 - flat_frac) * leg_imp)
+        part = route_pair(grid.graph, cur, waypoints[i], seg, w,
                           best_effort=True)
         if not part:
             continue
@@ -1568,6 +1620,12 @@ CONFIG = dict(
     # Street network location (default: midtown Manhattan).
     lat=40.7527,
     lng=-73.9943,
+    # Canvas size. Fidelity ~ blocks-per-shape, and this is its main lever: on
+    # the Chicago snapshot, 1600 -> 2400 alone was worth ~ +0.10 IoU (~3x any
+    # routing change ever measured here), paid in route length (13-22 km at
+    # 2400). Pick by how far you want to run, not by how big a network you can
+    # fetch. (An auto "target_blocks" knob is future work -- see
+    # docs/recognizability-plan.md.)
     radius_m=1600,
     # Optional: path to a saved ox.save_graphml network to load instead of
     # fetching from the Overpass API (offline / reproducible real-map runs).
@@ -1620,10 +1678,26 @@ CONFIG = dict(
     inner_min_span_blocks=6.0,
     inner_max_inflate=3.0,
 
+    # Template simplification (simplify_template). The contour is a template,
+    # not a constraint: keep only the ~template_vertices corners that carry the
+    # figure's identity and let the streets draw clean lines between them,
+    # instead of asking the router to chase thousands of raster-jitter points it
+    # can only render as staircase. Corner-preserving (RDP), so a knight's snout
+    # and a star's tips survive -- measured on real Chicago as part of the
+    # largest fidelity jump this project has recorded (see
+    # docs/recognizability-plan.md). None/0 disables (trace the raw raster).
+    template_vertices=22,
+
     # Placement search.
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
-    aspect_max=1.5,           # max area-preserving stretch (1.0 = uniform scale)
-    shear_max=0.20,           # max skew, for non-orthogonal grids
+    # Warp caps. Placement search may stretch/shear the template to seat it on
+    # the street fabric -- but a horse stretched 1.5x with 0.2 shear no longer
+    # reads as a horse, however well it traces (and no adherence metric notices,
+    # because they all score against the warped copy). Capped tight by default;
+    # raise for abstract/geometric shapes on strongly anisotropic grids (the
+    # original Manhattan-blocks rationale for the wide caps).
+    aspect_max=1.15,          # max area-preserving stretch (1.0 = uniform scale)
+    shear_max=0.05,           # max skew, for non-orthogonal grids
     reflect=True,             # also search mirror-image placements (a shark faces
                               #   either way): doubles the orientations available to
                               #   line the outline up with the streets
@@ -1652,6 +1726,12 @@ CONFIG = dict(
 
     # Routing / fidelity.
     deviation_weight=60.0,    # >> 1 makes "stay on the outline" dominate cost
+    # Feature-hug profile (route_contour): each leg's deviation weight ramps
+    # with the local waypoint_importance -- full hug at defining corners, down
+    # to this fraction on featureless stretches, where the anchors alone
+    # constrain the path and the streets pick the clean line between them.
+    # 1.0 restores the constant-weight hug everywhere.
+    flat_deviation_frac=0.35,
 
     # Granularity: 0.0 = smooth, fewer steps, shorter and easier to run;
     #              1.0 = trace every jog of the shape, longer and more expressive.
