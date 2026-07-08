@@ -223,11 +223,21 @@ still reads as the shape. Why this wins where the router knobs didn't: it change
 the *input*, never a cost the search optimizes — the discipline the whole plan is
 built on. Default-ON (`fd_lowpass=True`), gated; set `fd_lowpass=False` to disable.
 
-Natural follow-ups now unblocked: the `turn_weight` and `trellis` knobs should be
-re-tested *on the low-passed target* (their corner-rounding is largely moot once
-the sub-block detail they fought is already gone — they may flip to net-positive),
-and `fd_harmonics` could be derived per-run from the placed blocks-per-shape
-rather than fixed at 20.
+**Re-test of the router knobs on the low-passed target (measured).** The
+hypothesis was that `turn_weight` / `trellis` were penalized for corner-rounding
+they no longer need once the sub-block detail is gone. Measured over all shapes
+with `fd_lowpass` on (means): base `frechet 0.0338, iou 0.654, turning 0.379`;
+`+turn_weight` `0.0341 / 0.642 / 0.384` (still net-negative — Frechet up, IoU
+down: it does not flip, the corner-rounding was not its only problem); `+trellis`
+`0.0349 / 0.667 / 0.384` — a **broad IoU gain** (+2%: Crow/Horse/Pawn/donut/face/
+lshape/star all rise) bought with a small Frechet cost concentrated on the pointy
+shapes (lshape/square 0.012→0.019). So the trellis is a **coverage-vs-order
+tradeoff, not a clean flip**, and both stay default-OFF. The one avenue left for
+the trellis is a gate (apply on organic shapes, skip pointy ones) to bank the IoU
+gain without the pointy-shape Frechet cost — future work. Separately,
+`fd_harmonics` could be derived per-run from placed blocks-per-shape rather than
+fixed at 20. Verdict stands: **the input-side low-pass is the win; the router-side
+knobs are not, low-passed target or no.**
 
 ### Deferred / prototype-behind-a-flag
 Change 2 (perf-only, semantics-changing, not a bottleneck). Idea B + Change 4
