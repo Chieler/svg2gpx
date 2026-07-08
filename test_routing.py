@@ -128,8 +128,36 @@ def main():
     check(cand.route[0] == cand.route[-1], "pipeline smoke: star route is closed")
 
     dissolve_checks()
+    momentum_checks()
 
     print("\nall routing checks passed")
+
+
+def momentum_checks():
+    """The turn-penalty (momentum) router: turn_weight=0 is byte-identical to the
+    bare-node Dijkstra, and turn_weight>0 still yields a connected walk."""
+    grid = two_island_grid()
+    west = (0.1, 0.4)
+    seg = np.array([west, (0.2, 0.5)])
+    plain = route_pair(grid.graph, west, (0.2, 0.5), seg, 30.0)
+    same = route_pair(grid.graph, west, (0.2, 0.5), seg, 30.0, turn_weight=0.0)
+    check(plain == same, "turn_weight=0 matches the bare-node router exactly")
+    momentum = route_pair(grid.graph, west, (0.2, 0.5), seg, 30.0,
+                          turn_weight=20.0, avg_edge=grid.avg_edge)
+    check(len(momentum) >= 2 and momentum[0] == west and momentum[-1] == (0.2, 0.5)
+          and is_connected_walk(momentum, grid.graph),
+          "turn_weight>0 still returns a connected walk to the target")
+
+    # End-to-end: the penalty produces a closed connected walk on the lattice.
+    cfg = dict(gen.CONFIG)
+    cfg.update(grid_size=30, grid_diagonals=True, n_random=300, n_refine=100,
+               n_route_eval=2, inner_features=False, turn_weight=25.0)
+    lattice = synthetic_grid(cfg)
+    spec = gen.extract_shape("shapes/star.svg", 512)
+    cand = search_placement(spec.outer, lattice, cfg)[0]
+    check(len(cand.route) > 10 and is_connected_walk(cand.route, lattice.graph)
+          and cand.route[0] == cand.route[-1],
+          "pipeline smoke with turn_weight>0: closed connected walk")
 
 
 if __name__ == "__main__":

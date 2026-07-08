@@ -26,6 +26,7 @@ Tune everything from CONFIG. Run:  python script.py
 """
 
 import heapq
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -654,7 +655,8 @@ def build_route(grid, placed, cfg):
     if len(waypoints) < 3:
         return [], dense, waypoints
     w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w)
+    tw = cfg.get("turn_weight", 0.0)
+    route = route_contour(grid, dense, waypoints, wp_idx, w, turn_weight=tw)
     route = cleanup(grid, route, dense, wp_idx, w, cfg)
     return route, dense, waypoints
 
@@ -693,7 +695,8 @@ def build_feature_route(grid, placed_feat, closed, cfg):
     if len(waypoints) < (3 if closed else 2):
         return []
     w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w)
+    tw = cfg.get("turn_weight", 0.0)
+    route = route_contour(grid, dense, waypoints, wp_idx, w, turn_weight=tw)
     return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed)
 
 
@@ -921,13 +924,19 @@ def search_placement(contour, grid, cfg, inners=None):
     center = np.asarray(contour, np.float64).mean(axis=0)
     w_inner = cfg.get("inner_cost_weight", 0.6)
     w_recog = cfg.get("recognition_weight", 0.6)
+    # The turn penalty is a *rendering* improvement, not a selection signal:
+    # letting it change which placement wins reintroduces the very artifact the
+    # plan warns about (a higher-overlap but more-combed placement outranking a
+    # clean one). So rank placements on the turn_weight=0 route (unchanged,
+    # validated behaviour) and re-route the winners with the penalty afterwards.
+    sel_cfg = {**cfg, "turn_weight": 0.0}
     routed, tried, chosen_params = [], 0, []
     for proxy_score, params in results:
         if any(not _placement_far(params, q) for q in chosen_params):
             continue                                   # skip near-duplicate placement
         chosen_params.append(params)
         placed = place(contour, *params)
-        route, _, _ = build_route(grid, placed, cfg)
+        route, _, _ = build_route(grid, placed, sel_cfg)
         if len(route) >= 3:
             # Selection cost. placement_cost (perceptual soft-IoU + geometric)
             # maximizes area overlap, which can prefer a lumpy blob with slightly
@@ -965,6 +974,12 @@ def search_placement(contour, grid, cfg, inners=None):
                           route_features(grid, inners, params, center, cfg))]
 
     routed.sort(key=lambda c: c.cost)
+    # Re-route the ranked winners with the turn penalty (selection already fixed
+    # above at turn_weight=0). The cost keeps its validated basis; only the route
+    # that gets rendered/measured gains the combing suppression.
+    if cfg.get("turn_weight", 0.0) > 0.0:
+        for cand in routed:
+            cand.route = build_route(grid, cand.placed, cfg)[0]
     return routed
 
 
@@ -1041,7 +1056,50 @@ def _polyline_dist_fn(seg):
     return dist
 
 
-def route_pair(graph, src, dst, seg, weight, best_effort=False):
+def _polyline_dist_dir_fn(seg):
+    """Like _polyline_dist_fn, but also returns the outline's local tangent.
+
+    For a point p, returns (min distance to `seg`, unit tangent of the closest
+    segment). The tangent -- directed along seg, i.e. the way the outline runs --
+    lets the router compare how much the STREET turns against how much the SHAPE
+    turns at the same spot (see route_pair's momentum term). None tangent for a
+    degenerate seg.
+    """
+    seg = np.asarray(seg, dtype=np.float64)
+    if len(seg) < 2:
+        anchor = seg[0] if len(seg) else None
+        def f0(p):
+            if anchor is None:
+                return 0.0, None
+            return float(np.hypot(*(np.asarray(p) - anchor))), None
+        return f0
+    a, b = seg[:-1], seg[1:]
+    d = b - a
+    L = np.einsum("ij,ij->i", d, d)
+    ok = L > 1e-18
+    dirs = np.zeros_like(d)
+    dirs[ok] = d[ok] / np.sqrt(L[ok])[:, None]
+
+    def f(p):
+        p = np.asarray(p, dtype=np.float64)
+        t = np.zeros(len(L))
+        t[ok] = np.clip(np.einsum("ij,ij->i", p - a, d)[ok] / L[ok], 0.0, 1.0)
+        proj = a + t[:, None] * d
+        dd = np.hypot(proj[:, 0] - p[0], proj[:, 1] - p[1])
+        k = int(np.argmin(dd))
+        tan = (float(dirs[k, 0]), float(dirs[k, 1])) if ok[k] else None
+        return float(dd[k]), tan
+    return f
+
+
+def _angle_between(a, b):
+    """Unsigned angle in [0, pi] between two unit 2-vectors."""
+    dot = a[0] * b[0] + a[1] * b[1]
+    return math.acos(-1.0 if dot < -1.0 else 1.0 if dot > 1.0 else dot)
+
+
+def route_pair(graph, src, dst, seg, weight, best_effort=False,
+               turn_weight=0.0, avg_edge=1.0):
     """Dijkstra from src to dst, penalizing distance from the local outline arc.
 
     Cost = edge_length + weight * distance_to_outline(neighbor). With weight >> 1
@@ -1052,9 +1110,18 @@ def route_pair(graph, src, dst, seg, weight, best_effort=False):
     to dst (the closest approach) instead of []. The caller continues from that
     node, so the assembled route stays a connected walk on real edges rather
     than teleporting across the gap.
+
+    turn_weight>0 adds the momentum term (see _route_pair_momentum): it penalizes
+    turns the street makes that the shape does not, killing comb teeth before
+    they form. turn_weight=0 dispatches to the original bare-node Dijkstra
+    unchanged, so straightening callers (shortcut_nooks, dissolve_oscillations)
+    and every existing behaviour are byte-identical.
     """
     if src == dst:
         return [src]
+    if turn_weight > 0.0:
+        return _route_pair_momentum(graph, src, dst, seg, weight, best_effort,
+                                    turn_weight, avg_edge)
     dist_to = _polyline_dist_fn(seg)
     dev = {}                 # node -> distance to outline, computed once per node
     heap = [(0.0, 0, src)]
@@ -1096,7 +1163,100 @@ def route_pair(graph, src, dst, seg, weight, best_effort=False):
     return path[::-1]
 
 
-def route_contour(grid, dense, waypoints, wp_idx, weight):
+def _route_pair_momentum(graph, src, dst, seg, weight, best_effort,
+                         turn_weight, avg_edge):
+    """Contour-biased Dijkstra with a relative turn (momentum) penalty.
+
+    Step cost = edge_length
+              + weight     * distance_to_outline(neighbor)
+              + turn_weight * max(0, street_turn - contour_turn) * avg_edge
+
+    The turn term needs the direction the runner arrived from, so the search
+    state is the (node, came_from) pair rather than the bare node -- a standard
+    state lift that keeps Dijkstra exact while letting cost depend on heading. It
+    stays cheap because the arc between two dense anchors is short.
+
+    `street_turn` is the heading change from the incoming edge to the candidate
+    edge; `contour_turn` is how much the target outline itself bends there (the
+    angle between its local tangents at u and v). Subtracting makes a turn the
+    SHAPE also makes (a real corner) free, while a turn only the STREET makes (a
+    comb tooth poking off a straight belly) is penalized in proportion to the
+    surplus. So combing is suppressed at the source, corners are still pivoted
+    cleanly, and the curvature modulation ("go slow at corners") falls out of the
+    contour_turn subtraction rather than needing a separate schedule.
+    """
+    dist_dir = _polyline_dist_dir_fn(seg)
+    info = {}                       # node -> (dist_to_outline, local tangent)
+
+    def dd(x):
+        r = info.get(x)
+        if r is None:
+            r = info[x] = dist_dir(x)
+        return r
+
+    heap = [(0.0, 0, src, None)]
+    best = {(src, None): 0.0}
+    prev = {(src, None): None}      # state -> previous state
+    seen = set()                    # finalized states
+    node_state = {}                 # node -> its finalized (min-cost) state
+    end_state, c = None, 1
+    while heap:
+        cost, _, u, p = heapq.heappop(heap)
+        state = (u, p)
+        if state in seen:
+            continue
+        seen.add(state)
+        node_state.setdefault(u, state)
+        if u == dst:
+            end_state = state
+            break
+        _, tu = dd(u)
+        in_dir = None
+        if p is not None:
+            ix, iy = u[0] - p[0], u[1] - p[1]
+            n = math.hypot(ix, iy)
+            if n > 1e-12:
+                in_dir = (ix / n, iy / n)
+        for v, w in graph.get(u, ()):
+            nstate = (v, u)
+            if nstate in seen:
+                continue
+            dv, tv = dd(v)
+            pen = 0.0
+            if in_dir is not None:
+                ox, oy = v[0] - u[0], v[1] - u[1]
+                n = math.hypot(ox, oy)
+                if n > 1e-12:
+                    out_dir = (ox / n, oy / n)
+                    street_turn = _angle_between(in_dir, out_dir)
+                    contour_turn = (_angle_between(tu, tv)
+                                    if tu is not None and tv is not None else 0.0)
+                    excess = street_turn - contour_turn
+                    if excess > 0.0:
+                        pen = turn_weight * excess * avg_edge
+            nc = cost + w + weight * dv + pen
+            if nc < best.get(nstate, np.inf):
+                best[nstate] = nc
+                prev[nstate] = state
+                heapq.heappush(heap, (nc, c, v, u))
+                c += 1
+    if end_state is None:
+        if not best_effort or not node_state:
+            return []
+        # dst unreachable: bridge to the finalized node nearest to it.
+        nodes = list(node_state)
+        arr = np.asarray(nodes, dtype=np.float64)
+        nearest = nodes[int(np.argmin(np.hypot(arr[:, 0] - dst[0],
+                                               arr[:, 1] - dst[1])))]
+        end_state = node_state[nearest]
+    path, s = [], end_state
+    while s is not None:
+        path.append(s[0])
+        s = prev[s]
+    return path[::-1]
+
+
+def route_contour(grid, dense, waypoints, wp_idx, weight, turn_weight=0.0):
     """Chain route_pair across all waypoints, sharing junction nodes.
 
     An unreachable waypoint (a disconnected pocket in the graph) doesn't break
@@ -1112,7 +1272,8 @@ def route_contour(grid, dense, waypoints, wp_idx, weight):
         if len(seg) < 2:
             seg = np.array([cur, waypoints[i]])
         part = route_pair(grid.graph, cur, waypoints[i], seg, weight,
-                          best_effort=True)
+                          best_effort=True, turn_weight=turn_weight,
+                          avg_edge=grid.avg_edge)
         if not part:
             continue
         route.extend(part[1:] if route else part)
@@ -1279,7 +1440,8 @@ def cleanup(grid, route, dense, wp_idx, weight, cfg, close=True):
 
     route = remove_backtracks(route, contour_tree, tol)
     if close:
-        route = close_loop(grid, route, dense, wp_idx, weight)
+        route = close_loop(grid, route, dense, wp_idx, weight,
+                           turn_weight=cfg.get("turn_weight", 0.0))
     if len(route) < 4:
         return route
     closed = route[0] == route[-1]
@@ -1298,13 +1460,14 @@ def cleanup(grid, route, dense, wp_idx, weight, cfg, close=True):
     return body + [body[0]] if closed else body
 
 
-def close_loop(grid, route, dense, wp_idx, weight):
+def close_loop(grid, route, dense, wp_idx, weight, turn_weight=0.0):
     """Route the wrap-around arc from the last waypoint back to the first."""
     if len(route) < 2 or route[-1] == route[0]:
         return route
     seg = np.vstack([dense[wp_idx[-1]:], dense[:wp_idx[0] + 1]])
     closing = route_pair(grid.graph, route[-1], route[0], seg, weight,
-                         best_effort=True)
+                         best_effort=True, turn_weight=turn_weight,
+                         avg_edge=grid.avg_edge)
     return route + closing[1:] if closing else route
 
 
@@ -1756,6 +1919,29 @@ CONFIG = dict(
 
     # Routing / fidelity.
     deviation_weight=60.0,    # >> 1 makes "stay on the outline" dominate cost
+
+    # Momentum / turn penalty (route_pair, EXPERIMENTAL, default OFF). Penalizes
+    # turns the STREET makes that the SHAPE does not --
+    # turn_weight * max(0, street_turn - contour_turn) * avg_edge -- so comb teeth
+    # (which pivot sharply off a straight belly) cost more than the sliver of
+    # deviation they save, while real corners (where the outline turns too) stay
+    # free. Lifts the router state to (node, parent); it is decoupled from
+    # placement selection (winners are ranked at 0, then re-routed) so it only
+    # changes the rendered route, never which placement wins. 0 disables it
+    # (bare-node Dijkstra, unchanged).
+    #
+    # Measured on the synthetic grid it reliably lowers the excess-turning
+    # (combing) metric on organic shapes (Cat 35->30, Knight 24->18, Crow 5->3)
+    # but at a small IoU cost, and on a lattice it cannot tell a comb tooth from
+    # the staircase approaching a sharp tip (both are ~45-90 deg turns), so at the
+    # strength that helps organic shapes it rounds pointy corners (star IoU
+    # 0.64->0.58). No single value satisfies "lower combing without lowering IoU
+    # on pointy shapes", so like recognition_weight it ships off pending a
+    # corner-content gate. Set >0 (e.g. 30) to enable; best paired with the
+    # FD-low-pass target (see docs/) which removes the sub-block detail the
+    # penalty would otherwise fight. The input-side low-pass remains the only
+    # measured clean visual win; this is the router-side complement.
+    turn_weight=0.0,
 
     # Granularity: 0.0 = smooth, fewer steps, shorter and easier to run;
     #              1.0 = trace every jog of the shape, longer and more expressive.

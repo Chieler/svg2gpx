@@ -6,7 +6,8 @@ layers. This is the counterpart to [`rendering-fidelity-plan.md`](rendering-fide
 which attacks the same artifact from the *input* side (Fourier low-pass matches
 the target's detail to the grid's Nyquist). The two are complementary: low-pass
 lowers the *demand* for combing, the changes here lower the *supply*.
-**Status: Phase 0 + Phase 1 implemented; Phase 2+ proposed.**
+**Status: Phase 0 + Phase 1 + Phase 2 implemented (Phase 2 ships default-OFF,
+see below); Phase 3+ proposed.**
 
 ## Diagnosis (measured on the synthetic 50×50 lattice, all bundled shapes)
 
@@ -41,7 +42,7 @@ an **independent combing metric + visual A/B**, not by the routing cost.
 
 | Idea (from README "Future Improvements") | Claim about the code | Accurate? | Verdict |
 | --- | --- | --- | --- |
-| A. Turn-penalized Dijkstra | `cost = len + weight·dist_to_outline(nbr)`, state = node only | ✅ (`gen.py` `route_pair`) | keystone (Phase 2) |
+| A. Turn-penalized Dijkstra | `cost = len + weight·dist_to_outline(nbr)`, state = node only | ✅ (`gen.py` `route_pair`) | **done (Phase 2), default-OFF** |
 | C. dissolve_oscillations | shortcut_nooks keeps a tooth that hugs the outline | ✅ | **done (Phase 1)** |
 | Change 1. Viterbi trellis | snap picks one node per anchor; a bad node compromises the path | ✅ | high value (Phase 3) |
 | Change 3. Monotonicity prune | combing = backward motion for micro-gain | plausible | fold into A as a *soft* term |
@@ -116,15 +117,37 @@ preserves because it hugs the outline. That case can't be exercised here
 `test_routing.py` (tooth collapses; faithful staircase preserved; output stays a
 connected walk) rather than by a benchmark delta.
 
-### Phase 2 — relative turn penalty in `route_pair` (proposed, the keystone)
-Lift the router state to `(node, parent)`; add a **relative** angular penalty
-`f(|street-turn − local-contour-turn|)` from the local `seg` tangent (a turn is
-free when the *shape* turns there, penalized when only the street does);
-modulate its weight by `waypoint_importance` (max on straights, ~0 at defining
-corners — the "Look-Ahead deceleration" idea); include Change 3 as the *soft*
-backward-dot component of the same term. Segments between anchors are short, so
-the lifted-state blow-up (×avg-degree) is cheap. Prevents combing at the source.
-Validate against the Phase-0 metric, **not** the routing cost.
+### Phase 2 — relative turn penalty in `route_pair` (done; ships default-OFF)
+Implemented. The router state is lifted to `(node, parent)` and the step cost
+gains `turn_weight · max(0, street_turn − contour_turn) · avg_edge`: a turn is
+free when the *shape* turns there (contour_turn high) and penalized when only the
+street does (a comb tooth off a straight belly). The "Look-Ahead deceleration"
+modulation falls out of the `contour_turn` subtraction — no separate schedule —
+and corners, being at anchor boundaries between independent legs, are never
+penalized. It is **decoupled from placement selection**: winners are ranked on
+the `turn_weight=0` route (unchanged, validated), then the returned route is
+re-solved with the penalty, so it only changes the *rendering*, never which
+placement wins. `turn_weight=0` dispatches to the original bare-node Dijkstra
+byte-for-byte (locked by a unit test).
+
+**Measured tradeoff (why it's OFF by default).** Held to a fixed placement, the
+penalty reliably lowers `excess` on organic shapes — Cat 35→30 (Frechet
+unchanged), Knight 24→18, Crow 5→3, Shark 1.0→0.7 — but always at a small IoU
+cost, because on a grid "fewer turns" means a straighter path that deviates more
+from a curvy outline. And on a lattice it **cannot separate a comb tooth from the
+staircase approaching a sharp tip** (both are ~45–90° turns — the same D7 problem,
+now on the cost side), so at the strength that helps organic shapes it rounds
+pointy corners: star Frechet 0.046→0.070, IoU 0.64→0.58; lshape IoU 0.64→0.61.
+No single `turn_weight` lowers combing *and* respects "don't lower IoU on pointy
+shapes." So, exactly like the repo's `recognition_weight`, it ships correct,
+decoupled, and **default-OFF** (`turn_weight=0.0`), a documented knob rather than
+a default. This is the third experiment (after the void and recognition terms) to
+confirm the FD-plan's thesis: **router/selection-side changes move the target
+metric but aren't a clean visual win; the input-side FD low-pass is.** The two
+compose — the penalty's corner-rounding is largely moot on an FD-low-passed
+target, which has already shed the sub-block detail the penalty fights — so the
+natural next step is to gate `turn_weight` on (low corner-content ∧ FD-low-pass
+applied).
 
 ### Phase 3 — Viterbi/trellis snap + route (proposed)
 Replace single-node snapping with `query_ball_point` candidate sets + a DP whose
