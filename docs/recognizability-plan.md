@@ -113,6 +113,28 @@ Shark 0.33→0.46, star 0.31→0.41, and the renders visibly read as the animals
    `target_blocks` knob is future work (radius is a data-fetch parameter, so
    auto-scaling it belongs with the fetch layer).
 
+## The compact suite and the distance floor (measured)
+
+Six compact silhouettes joined `shapes/` — pig, duck, heart, whale, ghost,
+mushroom — designed for the regime the pipeline is strongest in: identity in a
+dozen-odd macro-corners, no long thin limbs. A scale-down ladder on Chicago
+r1600 with the shipped engine (RDP + bend + budget), bands L≈10–13 km,
+M≈7–8 km, S≈5 km, XS≈3.2–4 km, gives the practical answer to "how short can a
+recognizable route be":
+
+- **duck and ghost read down to ~3.2–3.7 km** (the XS duck is unmistakably a
+  duck; the ghost keeps all three scallops);
+- **heart and mushroom hold to ~5 km** (the 5 km heart is clean);
+- **pig and whale want ~8 km+** (legs/flukes need the extra blocks).
+
+Two metric lessons from the same run: IoU stays flat-to-*up* as shapes shrink
+(small blobs overlap easily — more proof it cannot judge identity), and ledger
+recall crashes at small scale partly **mechanically**: its position tolerance
+scales with the shape while street quantization does not. `feature_ledger` now
+takes `pos_tol_abs` (the benchmark passes 1.5×avg_edge) so reported recall is
+resolution-fair; the bend guard keeps the stricter relative tolerance
+(conservative at small scale is the safe direction for a deformation budget).
+
 ## Follow-ups
 - ~~Implement the **feature ledger** metric (§2)~~ **done**: `feature_ledger`
   in gen.py (macro-corners via RDP, cyclic order-preserving DP matching,

@@ -1591,7 +1591,8 @@ def _macro_corners(poly, max_vertices=28, min_turn_deg=25.0):
     return q[keep], turn[keep]
 
 
-def feature_ledger(route, placed, pos_tol=0.08, ang_tol_deg=40.0):
+def feature_ledger(route, placed, pos_tol=0.08, ang_tol_deg=40.0,
+                   pos_tol_abs=None):
     """Audit the identity-carrying corners: recall / precision / angle error.
 
     The adherence metrics (IoU/Frechet) cannot see identity: a knight whose
@@ -1630,6 +1631,13 @@ def feature_ledger(route, placed, pos_tol=0.08, ang_tol_deg=40.0):
                        np.ptp(np.asarray(placed, np.float64)[:, 1]))) or 1.0
     skip, cap = 0.30, 0.60
     ang_tol = np.radians(ang_tol_deg)
+    # Resolution fairness: pos_tol scales with the shape, but street
+    # quantization does not -- a corner drawn on a ~100 m block can't sit
+    # closer than ~a block from its ideal spot however small the figure is.
+    # Callers that know the grid pass pos_tol_abs (e.g. 1.5 x avg_edge) and
+    # the effective tolerance is the larger of the two.
+    if pos_tol_abs is not None:
+        pos_tol = max(pos_tol, float(pos_tol_abs) / extent)
     best = None                                        # (total_cost, pairs, R, tR)
     for R, tR in ((R0, tR0), (R0[::-1].copy(), -tR0[::-1].copy())):
         posd = np.linalg.norm(P[:, None, :] - R[None, :, :], axis=2) / extent

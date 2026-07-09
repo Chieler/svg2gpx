@@ -154,7 +154,10 @@ def run_case(grid, case, cfg):
 
     best = ranked[0]
     cost, placed, route = best.cost, best.placed, best.route
-    led = feature_ledger(route, placed) if len(route) >= 2 else None
+    # pos_tol_abs: a corner can't sit closer than ~a street block from its
+    # ideal spot however small the figure -- keep recall resolution-fair.
+    led = (feature_ledger(route, placed, pos_tol_abs=1.5 * grid.avg_edge)
+           if len(route) >= 2 else None)
     if len(route) < 2:
         return {"name": case["name"], "nodes": len(route), "cost": cost,
                 "frechet": float("nan"), "hausdorff": float("nan"), "iou": 0.0,
