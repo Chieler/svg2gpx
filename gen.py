@@ -996,6 +996,46 @@ def feature_cost(grid, placed_outer, feats):
     return float(np.average(costs, weights=sizes)), weight
 
 
+def shape_compactness(contour):
+    """Isoperimetric quotient P^2 / (4 pi A): 1.0 = circle, higher = more
+    perimeter per area, i.e. elongation and protrusions.
+
+    Measured over the bundled suite it splits the two empirical engine
+    families with a natural gap: every compact/blob shape (circle 1.0 ...
+    pig 1.96) sits below 2.0, every protrusive/elongated one (Cat 3.1,
+    Shark 3.2, star 3.6, Horse 5.7) well above. Crow lands exactly at 2.0
+    and Pawn at 2.3 -- the only genuinely ambiguous cases.
+    """
+    p = resample(np.asarray(contour, dtype=np.float64), n=400)
+    q = p[:-1]
+    per = float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+    area = abs(float(np.sum(q[:, 0] * np.roll(q[:, 1], -1)
+                            - np.roll(q[:, 0], -1) * q[:, 1]))) / 2.0
+    return per * per / (4.0 * np.pi * area) if area > 1e-12 else float("inf")
+
+
+def _dispatch_engine(contour, cfg):
+    """Route the shape to the engine family that measured best for it.
+
+    The two engines have opposite strengths (measured on real Chicago):
+    the compact recipe (RDP template + elastic bend + tight warp caps +
+    feature-hug) wins on blob shapes whose identity is a few notches, while
+    the classic engine (raw template, full hug, free warp) wins on elongated
+    shapes with protrusions, whose limbs need the hug and the seating freedom.
+    engine="auto" (default) picks by shape_compactness; an explicit engine
+    name applies that ENGINE_PRESETS entry; None/False disables dispatch and
+    the cfg is used as-is.
+    """
+    eng = cfg.get("engine", "auto")
+    if not eng:
+        return cfg
+    if eng == "auto":
+        c = shape_compactness(contour)
+        eng = "recipe" if c <= cfg.get("compact_max_ipq", 2.0) else "classic"
+        print(f"  engine: {eng} (compactness {c:.2f})")
+    return {**cfg, **ENGINE_PRESETS.get(eng, {}), "engine": eng}
+
+
 def search_placement(contour, grid, cfg, inners=None):
     """Rank placements by their *routed* fidelity; return the best DISTINCT ones.
 
@@ -1012,6 +1052,7 @@ def search_placement(contour, grid, cfg, inners=None):
     that staircases badly) can't be fixed downstream -- only a different
     placement escapes it, so the caller presents several to choose from.
     """
+    cfg = _dispatch_engine(contour, cfg)     # route the shape to its engine
     rng = np.random.default_rng(cfg["seed"])
     # The contour is a template, not a constraint: reduce it to the corners
     # that carry its identity before asking streets to draw it (no-op when
@@ -2018,6 +2059,10 @@ CONFIG = dict(
     #               / scales) so you can pick the one whose street angles read best
     #               -- the fix for "every option has the same shallow-angle steps".
     # "detail":     fix the single best placement, vary detail via option_presets.
+    # "engines":    cover the bases -- five INDEPENDENT searches, one per
+    #               ENGINE_PRESETS panel (three classic detail levels for
+    #               elongated/protrusive shapes, the compact recipe, and the
+    #               hybrid middle), presented side by side for the human pick.
     option_mode="placements",
     n_options=3,
     option_presets={
@@ -2031,8 +2076,39 @@ CONFIG = dict(
     # (beak, leg, tail). Higher = more forgiving of genuine thin features.
     protrusion_tolerance=2.5,
 
+    # Engine dispatch (_dispatch_engine). The two engine families have opposite
+    # measured strengths: the compact recipe wins on blob shapes (identity in a
+    # few notches), the classic engine wins on elongated/protrusive shapes
+    # (limbs need the full hug and free warp). "auto" picks per shape by
+    # shape_compactness (<= compact_max_ipq -> recipe, else classic); an
+    # explicit ENGINE_PRESETS name forces that engine; None disables dispatch.
+    engine="auto",
+    compact_max_ipq=2.0,
+
     seed=42,
 )
+
+# Engine presets: complete knob bundles for the two measured engine families
+# plus the coverage panels of option_mode="engines". "classic" reproduces
+# main's engine (raw template, constant hug, free warp) and respects the
+# user's granularity; the three classic-* variants pin the detail level;
+# "recipe" is this branch's compact engine (RDP template + elastic bend with
+# the identity budget + tight warp caps + feature-hug); "hybrid" is the middle
+# ground -- simplified template and relaxed flats, but classic seating freedom
+# and no bend.
+_CLASSIC = dict(template_vertices=None, bend_template=False,
+                flat_deviation_frac=1.0, aspect_max=1.5, shear_max=0.20)
+ENGINE_PRESETS = {
+    "classic":           dict(_CLASSIC),
+    "classic-faithful":  {**_CLASSIC, "granularity": 0.90},
+    "classic-simple":    {**_CLASSIC, "granularity": 0.35},
+    "classic-efficient": {**_CLASSIC, "granularity": 0.65, "deviation_weight": 1.0},
+    "recipe":            {},
+    "hybrid":            dict(bend_template=False, aspect_max=1.5, shear_max=0.20),
+}
+# The five side-by-side panels of option_mode="engines".
+ENGINE_PANELS = ["classic-faithful", "classic-simple", "classic-efficient",
+                 "recipe", "hybrid"]
 
 
 def main(cfg=CONFIG):
@@ -2045,9 +2121,23 @@ def main(cfg=CONFIG):
         print(f"inner features: {len(spec.inners)} "
               f"({len(spec.inners) - n_open} closed loop(s), {n_open} open path(s))")
     inners = spec.inners if cfg.get("inner_features", True) else []
+    save, show = cfg.get("save_plot"), cfg.get("show_plot", True)
+
+    if cfg.get("present_options") and cfg["option_mode"] == "engines":
+        # Cover the bases: one INDEPENDENT search per engine panel (each engine
+        # wants its own placement -- warp caps and template differ), human picks.
+        panels = []
+        for name in ENGINE_PANELS:
+            c2 = {**cfg, **ENGINE_PRESETS[name], "engine": name}
+            panels.append((name, search_placement(contour, grid, c2,
+                                                  inners=inners)[0]))
+        for label, cand in panels:
+            _report(label, grid, cand)
+        plot_options(grid, panels, save=save, show=show)
+        return [cand for _, cand in panels]
+
     ranked = search_placement(contour, grid, cfg, inners=inners)   # [Candidate, ...]
     best = ranked[0]
-    save, show = cfg.get("save_plot"), cfg.get("show_plot", True)
 
     if not cfg.get("present_options"):
         _report("route", grid, best)

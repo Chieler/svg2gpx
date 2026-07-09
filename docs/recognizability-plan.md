@@ -135,6 +135,28 @@ takes `pos_tol_abs` (the benchmark passes 1.5×avg_edge) so reported recall is
 resolution-fair; the bend guard keeps the stricter relative tolerance
 (conservative at small scale is the safe direction for a deformation budget).
 
+## Hybrid: engine dispatch + the "engines" presentation (measured)
+
+The two engine families have opposite strengths, confirmed per shape on
+Chicago: classic (raw template, constant hug, free warp) wins
+elongated/protrusive shapes — Shark ledger recall 0.44–0.50 across its three
+detail levels vs 0.20 under the recipe, which loses the fin — while the compact
+recipe matches classic IoU on the duck at 25% less distance (9.0 vs 11.9 km).
+Two delivery modes, both shipped:
+
+- **`engine="auto"`** (default): `shape_compactness` (isoperimetric quotient
+  P²/4πA) routes each shape to its family. Measured over the suite the split
+  has a natural gap at 2.0 — every blob shape ≤ 1.96, every protrusive one
+  ≥ 3.1 (Crow at exactly 2.00 and Pawn at 2.27 are the only ambiguous cases,
+  to be settled by verdicts). Explicit `ENGINE_PRESETS` names force an engine;
+  `None` disables dispatch.
+- **`option_mode="engines"`**: five *independent* searches presented side by
+  side — three classic detail levels (faithful/simple/efficient), the compact
+  recipe, and the hybrid middle (RDP template + feature-hug, classic seating,
+  no bend; scored the duck's best recall 0.68) — covering the bases and
+  leaving the pick to the human, per doctrine.
+  See [`engines-panel-chicago.png`](engines-panel-chicago.png).
+
 ## Follow-ups
 - ~~Implement the **feature ledger** metric (§2)~~ **done**: `feature_ledger`
   in gen.py (macro-corners via RDP, cyclic order-preserving DP matching,

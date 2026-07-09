@@ -91,8 +91,31 @@ def main():
     check(cand.route[0] == cand.route[-1], "pipeline smoke: star route is closed")
 
     ledger_checks()
+    dispatch_checks()
 
     print("\nall routing checks passed")
+
+
+def dispatch_checks():
+    """Engine dispatch: compactness separates the families and auto routes
+    compact shapes to the recipe engine, protrusive ones to classic."""
+    heart = gen.extract_contour("shapes/heart.svg", 512)
+    star = gen.extract_contour("shapes/star.svg", 512)
+    c_heart, c_star = gen.shape_compactness(heart), gen.shape_compactness(star)
+    check(c_heart < 2.0 < c_star,
+          f"compactness separates heart ({c_heart:.2f}) from star ({c_star:.2f})")
+
+    cfg = dict(gen.CONFIG)
+    d_heart = gen._dispatch_engine(heart, cfg)
+    d_star = gen._dispatch_engine(star, cfg)
+    check(d_heart["engine"] == "recipe" and d_heart["bend_template"],
+          "auto dispatch: heart -> recipe engine (bend on)")
+    check(d_star["engine"] == "classic" and not d_star["bend_template"]
+          and d_star["template_vertices"] is None,
+          "auto dispatch: star -> classic engine (raw template, no bend)")
+    same = gen._dispatch_engine(star, {**cfg, "engine": None})
+    check("template_vertices" in same and same.get("engine") is None,
+          "engine=None disables dispatch (cfg used as-is)")
 
 
 def ledger_checks():
