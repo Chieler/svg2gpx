@@ -90,7 +90,59 @@ def main():
           "pipeline smoke: star route is a connected walk")
     check(cand.route[0] == cand.route[-1], "pipeline smoke: star route is closed")
 
+    ledger_checks()
+    dispatch_checks()
+
     print("\nall routing checks passed")
+
+
+def dispatch_checks():
+    """Engine dispatch: compactness separates the families and auto routes
+    compact shapes to the recipe engine, protrusive ones to classic."""
+    heart = gen.extract_contour("shapes/heart.svg", 512)
+    star = gen.extract_contour("shapes/star.svg", 512)
+    c_heart, c_star = gen.shape_compactness(heart), gen.shape_compactness(star)
+    check(c_heart < 2.0 < c_star,
+          f"compactness separates heart ({c_heart:.2f}) from star ({c_star:.2f})")
+
+    cfg = dict(gen.CONFIG)
+    d_heart = gen._dispatch_engine(heart, cfg)
+    d_star = gen._dispatch_engine(star, cfg)
+    check(d_heart["engine"] == "recipe" and d_heart["bend_template"],
+          "auto dispatch: heart -> recipe engine (bend on)")
+    check(d_star["engine"] == "classic" and not d_star["bend_template"]
+          and d_star["template_vertices"] is None,
+          "auto dispatch: star -> classic engine (raw template, no bend)")
+    same = gen._dispatch_engine(star, {**cfg, "engine": None})
+    check("template_vertices" in same and same.get("engine") is None,
+          "engine=None disables dispatch (cfg used as-is)")
+
+
+def ledger_checks():
+    """feature_ledger: perfect on identity, catches lost corners (recall) and
+    invented corners (precision) -- the two identity failures IoU cannot see."""
+    sq = np.array([(0., 0.), (1., 0.), (1., 1.), (0., 1.), (0., 0.)])
+    led = gen.feature_ledger(sq, sq)
+    check(led["recall"] > 0.99 and led["precision"] > 0.99,
+          "ledger: identity square scores recall=precision=1")
+
+    clipped = np.array([(0., 0.), (1., 0.), (1., .8), (.8, 1.), (0., 1.), (0., 0.)])
+    led = gen.feature_ledger(clipped, sq)
+    check(led["recall"] < 0.99 and abs(led["recall"] - 0.75) < 0.1,
+          "ledger: clipping one square corner drops recall to ~3/4")
+
+    tooth = np.array([(0., 0.), (.4, 0.), (.4, .15), (.5, .15), (.5, 0.),
+                      (1., 0.), (1., 1.), (0., 1.), (0., 0.)])
+    led = gen.feature_ledger(tooth, sq)
+    check(led["recall"] > 0.99, "ledger: a comb tooth does not hurt recall")
+    check(led["precision"] < 0.75,
+          "ledger: a comb tooth's invented corners drop precision")
+
+    t = np.linspace(0, 2 * np.pi, 200)
+    circle = np.column_stack([0.5 + 0.4 * np.cos(t), 0.5 + 0.4 * np.sin(t)])
+    led = gen.feature_ledger(circle, circle)
+    check(led["recall"] > 0.99 and led["n_template"] == 0,
+          "ledger: corner-free template is a vacuous pass, not a fail")
 
 
 if __name__ == "__main__":

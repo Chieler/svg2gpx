@@ -32,7 +32,7 @@ import numpy as np
 import cv2
 import skia
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString
+from shapely.geometry import LinearRing, LineString
 
 # osmnx (live OSM fetch) and matplotlib (plotting) are imported lazily inside the
 # functions that need them -- build_grid and plot* -- so that callers which only
@@ -337,6 +337,19 @@ def _arc_len(pts):
                                 axis=1).sum())
 
 
+def _outer_outline(binary, img_size, svg_path):
+    """Solidify interior holes, trace the largest external contour, return it
+    as a closed [0, 1] polyline (the shared core of extract_shape/contour)."""
+    holes = binary.copy()
+    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
+    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
+    ext, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not ext:
+        raise ValueError(f"no drawable outline found in {svg_path!r} "
+                         "(empty or unsupported SVG)")
+    return _close(_norm_pts(max(ext, key=cv2.contourArea)[:, 0, :], img_size))
+
+
 def extract_shape(svg_path, img_size, min_perimeter=0.05, dup_tol=None):
     """Render the SVG and extract the outer outline AND its inner features.
 
@@ -371,14 +384,7 @@ def extract_shape(svg_path, img_size, min_perimeter=0.05, dup_tol=None):
 
     # Outer outline: identical to the historical behaviour (solidify, then the
     # largest external contour).
-    holes = binary.copy()
-    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
-    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
-    ext, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not ext:
-        raise ValueError(f"no drawable outline found in {svg_path!r} "
-                         "(empty or unsupported SVG)")
-    outer = _close(_norm_pts(max(ext, key=cv2.contourArea)[:, 0, :], img_size))
+    outer = _outer_outline(binary, img_size, svg_path)
 
     # Full boundary tree of the raw ink mask, at pixel density.
     contours, hier = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
@@ -467,19 +473,7 @@ def extract_contour(svg_path, img_size):
     projected street grid. (Outline only -- use extract_shape() to also get the
     inner features.)
     """
-    binary = _render_ink_mask(svg_path, img_size)
-
-    # Flood from a corner then OR back in, so interior holes are treated as solid.
-    holes = binary.copy()
-    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
-    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
-
-    contours, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ValueError(f"no drawable outline found in {svg_path!r} "
-                         "(empty or unsupported SVG)")
-    outer = max(contours, key=cv2.contourArea)
-    return _close(_norm_pts(outer[:, 0, :], img_size))
+    return _outer_outline(_render_ink_mask(svg_path, img_size), img_size, svg_path)
 
 
 
@@ -492,6 +486,19 @@ def _close(pts):
     if not np.allclose(pts[0], pts[-1]):
         pts = np.vstack([pts, pts[0]])
     return pts
+
+
+def _rot(a):
+    """2x2 rotation matrix for angle `a` (radians)."""
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s], [s, c]])
+
+
+def _two_way_dists(a, b):
+    """(distance from each a-point to b, distance from each b-point to a)."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return cKDTree(b).query(a)[0], cKDTree(a).query(b)[0]
 
 
 def resample(pts, n=None, step=None, closed=True):
@@ -535,8 +542,7 @@ def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0, flip=False,
     """
     pts = np.asarray(pts, dtype=np.float64)
     c = np.asarray(center, dtype=np.float64) if center is not None else pts.mean(axis=0)
-    a = np.radians(rot_deg)
-    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    R = _rot(np.radians(rot_deg))
     H = np.array([[1.0, shear], [0.0, 1.0]])
     sx = -1.0 if flip else 1.0                      # mirror across the vertical axis
     Sc = np.array([[scale * aspect * sx, 0.0], [0.0, scale / aspect]])
@@ -567,6 +573,153 @@ def waypoint_importance(pts, k=4):
     imp = np.where(L > 1e-12, np.abs(cross) / np.where(L > 1e-12, L, 1.0), 0.0)
     peak = imp.max()
     return imp / peak if peak > 0 else imp
+
+
+def simplify_template(contour, max_vertices):
+    """Corner-preserving simplification (RDP) of the closed template.
+
+    The contour is a *template*, not a constraint: at street resolution
+    (~25-60 blocks per shape) the identity of a figure lives in a couple of
+    dozen corners -- a knight's snout, a shark's fin -- while the raster trace
+    carries thousands of sub-block jitter points the router can only render as
+    staircase/comb. Douglas-Peucker keeps exactly the corners and discards
+    exactly the jitter (the opposite trade to spectral smoothing, which rounds
+    corners and was measured to destroy compact shapes' identity on the real
+    Chicago grid; see docs/recognizability-plan.md). Epsilon is binary-searched
+    to land at <= `max_vertices` vertices. Falsy `max_vertices` disables; a
+    template already that simple is returned unchanged.
+    """
+    contour = np.asarray(contour, dtype=np.float64)
+    if not max_vertices or len(contour) <= max_vertices + 1:
+        return contour
+    pts = (contour[:-1] * 4096.0).astype(np.int32).reshape(-1, 1, 2)
+    peri = cv2.arcLength(pts, True)
+    lo, hi, best = 1e-5, 0.2, None
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        ap = cv2.approxPolyDP(pts, mid * peri, True)
+        if len(ap) > max_vertices:
+            lo = mid
+        else:
+            best, hi = ap, mid
+    if best is None or len(best) < 3:
+        return contour
+    return _close(best.reshape(-1, 2).astype(np.float64) / 4096.0)
+
+
+def bend_template(placed, grid, cfg):
+    """Elastically bend the placed template onto the street fabric (1-D ARAP).
+
+    The router can only draw along streets; a template line crossing blocks at
+    an arbitrary angle gets rendered as staircase however well it is routed.
+    Instead of asking the router to alias the mismatch away, deform the template
+    itself -- like an elastic wire pressed onto the lattice -- so its lines lie
+    ALONG streets before snapping ever happens. "As rigid as possible" is the
+    identity guarantee: local rotation is free, but stretching an edge or
+    changing a corner angle relative to the template costs energy, so a fin
+    stays a fin; it just leans onto the nearest street.
+
+    Formulation (local-global ARAP on the closed polyline, attraction annealed
+    like non-rigid ICP so global pose settles before limbs flex):
+
+        E = sum_j ||(P_{j+1}-P_j) - R(theta) E_j||^2 + lam * sum_i ||P_i - Q_i||^2
+
+    where E_j are the placed template's edge vectors, per-vertex rotations
+    R(theta_i) come from a closed-form 2-D Procrustes over each vertex's two
+    incident edges, Q_i is the nearest street node (densified nodes sit every
+    ~node_spacing metres, so nearest-node ~= nearest street point), and lam
+    ramps from loose to `bend_pull` over `bend_iters` rounds. The global step
+    is one cyclic tridiagonal solve per round. Returns a closed polyline.
+
+    Attraction targets are projections onto street SEGMENTS, not nodes: node
+    targets are discrete, so a polyline chasing them wobbles node-to-node;
+    segment projections of consecutive points land on the same street and are
+    collinear, so the solve pulls whole stretches into straight runs along the
+    block face -- the "elastic sheet pressed onto the lattice" behaviour, with
+    no explicit direction term needed. Known prototype limit: nothing yet
+    prevents a very thin limb from self-intersecting under heavy pull (see
+    docs/deformation-plan.md for the full formulation and roadmap).
+    """
+    ref = resample(placed, step=grid.avg_edge * cfg.get("bend_spacing", 0.75))
+    ref = np.asarray(ref[:-1], dtype=np.float64)     # cyclic: drop closing dup
+    n = len(ref)
+    if n < 8:
+        return placed
+    E = np.roll(ref, -1, axis=0) - ref               # reference edge vectors
+    P = ref.copy()
+    lam_final = cfg.get("bend_pull", 1.5)
+    outers = max(1, int(cfg.get("bend_iters", 8)))
+    I = np.eye(n)
+    L = 2.0 * I - np.roll(I, 1, axis=0) - np.roll(I, -1, axis=0)   # cyclic Laplacian
+
+    # Street segments for projection targets (edges are ~avg_edge long, so the
+    # nearest few midpoints reliably contain the truly nearest segment).
+    if grid.edge_list:
+        segA = np.asarray([e[0] for e in grid.edge_list], dtype=np.float64)
+        segB = np.asarray([e[1] for e in grid.edge_list], dtype=np.float64)
+        seg_tree = cKDTree(0.5 * (segA + segB))
+        segD = segB - segA
+        segL2 = np.maximum(np.einsum("ij,ij->i", segD, segD), 1e-18)
+    else:
+        seg_tree = None
+
+    def attract(pts):
+        """Per point: the closest point on the nearest street segment."""
+        if seg_tree is None:
+            return grid.nodes_arr[grid.tree.query(pts)[1]]
+        k = min(8, len(segA))
+        idx = seg_tree.query(pts, k=k)[1].reshape(len(pts), -1)
+        a, d = segA[idx], segD[idx]                          # (n, k, 2)
+        t = np.einsum("nkj,nkj->nk", pts[:, None, :] - a, d) / segL2[idx]
+        proj = a + np.clip(t, 0.0, 1.0)[..., None] * d
+        dist = np.einsum("nkj,nkj->nk", proj - pts[:, None, :],
+                         proj - pts[:, None, :])
+        return proj[np.arange(len(pts)), np.argmin(dist, axis=1)]
+
+    ref_closed = np.vstack([ref, ref[:1]])
+    guard = cfg.get("bend_min_recall", 0.85)
+    kept = P.copy()
+    for it in range(outers):
+        lam = lam_final * (it + 1) / outers          # stiffness annealing
+        Q = attract(P)                               # attraction targets
+        A = L + lam * I
+        for _ in range(3):                           # local-global iterations
+            e_cur = np.roll(P, -1, axis=0) - P
+            # Local: per-vertex Procrustes rotation over the two incident edges
+            # (edges i-1 and i). M = sum outer(e_cur, e_ref); theta from atan2.
+            cp, rp = np.roll(e_cur, 1, axis=0), np.roll(E, 1, axis=0)
+            m00 = cp[:, 0] * rp[:, 0] + e_cur[:, 0] * E[:, 0]
+            m01 = cp[:, 0] * rp[:, 1] + e_cur[:, 0] * E[:, 1]
+            m10 = cp[:, 1] * rp[:, 0] + e_cur[:, 1] * E[:, 0]
+            m11 = cp[:, 1] * rp[:, 1] + e_cur[:, 1] * E[:, 1]
+            th = np.arctan2(m10 - m01, m00 + m11)
+            c, s = np.cos(th), np.sin(th)
+            # Edge j's target = mean of its two endpoint rotations applied to E_j.
+            rx = c * E[:, 0] - s * E[:, 1]           # R(theta_j) E_j
+            ry = s * E[:, 0] + c * E[:, 1]
+            c2, s2 = np.roll(c, -1), np.roll(s, -1)  # R(theta_{j+1}) E_j
+            tx = 0.5 * (rx + c2 * E[:, 0] - s2 * E[:, 1])
+            ty = 0.5 * (ry + s2 * E[:, 0] + c2 * E[:, 1])
+            T = np.column_stack([np.roll(tx, 1) - tx, np.roll(ty, 1) - ty])
+            # Global: (L + lam I) P = T + lam Q, one solve per coordinate.
+            P = np.linalg.solve(A, T + lam * Q)
+        # Identity budget: anneal only while every defining corner survives
+        # (feature-ledger recall vs the unbent template) and the loop stays
+        # simple (a thin limb must not fold through itself). On violation,
+        # revert to the last within-budget state and stop pulling -- "at all
+        # cost" never means past the point where the figure stops being itself.
+        if guard:
+            ok = feature_ledger(np.vstack([P, P[:1]]), ref_closed)["recall"] >= guard
+            if ok:
+                try:
+                    ok = LinearRing(P).is_simple
+                except Exception:
+                    pass
+            if not ok:
+                P = kept
+                break
+            kept = P.copy()
+    return np.vstack([P, P[:1]])
 
 
 # --------------------------------------------------------------------------- #
@@ -648,15 +801,22 @@ def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
             or abs(a1 - a2) > daspect)
 
 
-def build_route(grid, placed, cfg):
-    """Run the full snap -> route -> cleanup pipeline for one placement."""
-    dense, waypoints, wp_idx = snap_waypoints(placed, grid, cfg)
-    if len(waypoints) < 3:
+def _route_polyline(grid, placed, cfg, closed=True, flat_frac=1.0):
+    """Shared snap -> route -> cleanup core for outer contours and features."""
+    dense, waypoints, wp_idx = snap_waypoints(placed, grid, cfg, closed=closed)
+    if len(waypoints) < (3 if closed else 2):
         return [], dense, waypoints
     w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w)
-    route = cleanup(grid, route, dense, wp_idx, w, cfg)
-    return route, dense, waypoints
+    route = route_contour(grid, dense, waypoints, wp_idx, w, flat_frac=flat_frac)
+    return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed), dense, waypoints
+
+
+def build_route(grid, placed, cfg):
+    """Run the full snap -> route -> cleanup pipeline for one placement."""
+    if cfg.get("bend_template", True):
+        placed = bend_template(placed, grid, cfg)
+    return _route_polyline(grid, placed, cfg, closed=True,
+                           flat_frac=cfg.get("flat_deviation_frac", 1.0))
 
 
 @dataclass
@@ -689,20 +849,14 @@ def build_feature_route(grid, placed_feat, closed, cfg):
     if full > 0 and 0.12 * span < full * (1.0 - g) ** 0.6:
         g_feat = 1.0 - (0.12 * span / full) ** (1.0 / 0.6)
         cfg = {**cfg, "granularity": float(np.clip(g_feat, g, 1.0))}
-    dense, waypoints, wp_idx = snap_waypoints(placed_feat, grid, cfg, closed=closed)
-    if len(waypoints) < (3 if closed else 2):
-        return []
-    w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w)
-    return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed)
+    # Features keep the full hug (flat_frac 1.0): they are all feature.
+    return _route_polyline(grid, placed_feat, cfg, closed=closed)[0]
 
 
 def _feat_deviation(route, target):
     """Mean two-way deviation between a feature's route and its target."""
-    r = np.asarray(route, np.float64)
-    t = np.asarray(target, np.float64)
-    return 0.5 * (float(cKDTree(r).query(t)[0].mean())
-                  + float(cKDTree(t).query(r)[0].mean()))
+    d_t2r, d_r2t = _two_way_dists(target, route)
+    return 0.5 * (float(d_t2r.mean()) + float(d_r2t.mean()))
 
 
 def refine_feature(grid, fp0, closed, cfg):
@@ -755,7 +909,7 @@ def refine_feature(grid, fp0, closed, cfg):
     rescue = max(scales) if span < min_span else None
     scored = []
     for a in rots:
-        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        R = _rot(a)
         rotated = proxy_pts @ R.T
         for s in sorted(scales):
             base = rotated * s
@@ -787,7 +941,7 @@ def refine_feature(grid, fp0, closed, cfg):
 
     best = None
     for proxy, a, s, c, drift in chosen:
-        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        R = _rot(a)
         fp = (fp0 - c0) @ R.T * s + c
         fr = build_feature_route(grid, fp, closed, cfg)
         if len(fr) < 2:
@@ -846,6 +1000,46 @@ def feature_cost(grid, placed_outer, feats):
     return float(np.average(costs, weights=sizes)), weight
 
 
+def shape_compactness(contour):
+    """Isoperimetric quotient P^2 / (4 pi A): 1.0 = circle, higher = more
+    perimeter per area, i.e. elongation and protrusions.
+
+    Measured over the bundled suite it splits the two empirical engine
+    families with a natural gap: every compact/blob shape (circle 1.0 ...
+    pig 1.96) sits below 2.0, every protrusive/elongated one (Cat 3.1,
+    Shark 3.2, star 3.6, Horse 5.7) well above. Crow lands exactly at 2.0
+    and Pawn at 2.3 -- the only genuinely ambiguous cases.
+    """
+    p = resample(np.asarray(contour, dtype=np.float64), n=400)
+    q = p[:-1]
+    per = float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+    area = abs(float(np.sum(q[:, 0] * np.roll(q[:, 1], -1)
+                            - np.roll(q[:, 0], -1) * q[:, 1]))) / 2.0
+    return per * per / (4.0 * np.pi * area) if area > 1e-12 else float("inf")
+
+
+def _dispatch_engine(contour, cfg):
+    """Route the shape to the engine family that measured best for it.
+
+    The two engines have opposite strengths (measured on real Chicago):
+    the compact recipe (RDP template + elastic bend + tight warp caps +
+    feature-hug) wins on blob shapes whose identity is a few notches, while
+    the classic engine (raw template, full hug, free warp) wins on elongated
+    shapes with protrusions, whose limbs need the hug and the seating freedom.
+    engine="auto" (default) picks by shape_compactness; an explicit engine
+    name applies that ENGINE_PRESETS entry; None/False disables dispatch and
+    the cfg is used as-is.
+    """
+    eng = cfg.get("engine", "auto")
+    if not eng:
+        return cfg
+    if eng == "auto":
+        c = shape_compactness(contour)
+        eng = "recipe" if c <= cfg.get("compact_max_ipq", 2.0) else "classic"
+        print(f"  engine: {eng} (compactness {c:.2f})")
+    return {**cfg, **ENGINE_PRESETS.get(eng, {}), "engine": eng}
+
+
 def search_placement(contour, grid, cfg, inners=None):
     """Rank placements by their *routed* fidelity; return the best DISTINCT ones.
 
@@ -862,7 +1056,12 @@ def search_placement(contour, grid, cfg, inners=None):
     that staircases badly) can't be fixed downstream -- only a different
     placement escapes it, so the caller presents several to choose from.
     """
+    cfg = _dispatch_engine(contour, cfg)     # route the shape to its engine
     rng = np.random.default_rng(cfg["seed"])
+    # The contour is a template, not a constraint: reduce it to the corners
+    # that carry its identity before asking streets to draw it (no-op when
+    # template_vertices is falsy or the template is already that simple).
+    contour = simplify_template(contour, cfg.get("template_vertices"))
     base = resample(contour, n=250)          # cheap, transform-invariant proxy
     importance = waypoint_importance(base)   # which of those points define the shape
     s_lo, s_hi = cfg["scale_range"]
@@ -895,7 +1094,18 @@ def search_placement(contour, grid, cfg, inners=None):
         return (_score(cand, grid, scale, cfg, importance, fp, feat_w, feat_share),
                 (scale, rot, dx, dy, aspect, shear, flip))
 
-    results = [trial(rng.uniform(s_lo, s_hi), rng.uniform(0, 360),
+    # Orientation prior: figurative shapes have a canonical orientation (a shark
+    # swims horizontally; a 90 deg-rotated one stops reading as a shark even at
+    # perfect overlap -- and no overlap metric notices). rot_max caps placement
+    # rotation around the drawn orientation; None = free spin (abstract shapes).
+    rot_max = cfg.get("rot_max")
+    def rrot():
+        return (rng.uniform(-rot_max, rot_max) if rot_max is not None
+                else rng.uniform(0, 360))
+    def rclamp(r):
+        return float(np.clip(r, -rot_max, rot_max)) if rot_max is not None else r
+
+    results = [trial(rng.uniform(s_lo, s_hi), rrot(),
                      rng.uniform(-lim, lim), rng.uniform(-lim, lim),
                      float(np.exp(rng.uniform(-ln_a, ln_a))), rng.uniform(-shm, shm),
                      rflip())
@@ -906,7 +1116,7 @@ def search_placement(contour, grid, cfg, inners=None):
         _, (s, r, dx, dy, asp, sh, fl) = results[rng.integers(0, min(8, len(results)))]
         results.append(trial(
             float(np.clip(s + rng.normal(0, 0.04), s_lo, s_hi)),
-            r + rng.normal(0, 6),
+            rclamp(r + rng.normal(0, 6)),
             dx + rng.normal(0, 0.03),
             dy + rng.normal(0, 0.03),
             float(np.clip(asp * np.exp(rng.normal(0, 0.05)), 1 / cfg["aspect_max"], cfg["aspect_max"])),
@@ -1096,7 +1306,7 @@ def route_pair(graph, src, dst, seg, weight, best_effort=False):
     return path[::-1]
 
 
-def route_contour(grid, dense, waypoints, wp_idx, weight):
+def route_contour(grid, dense, waypoints, wp_idx, weight, flat_frac=1.0):
     """Chain route_pair across all waypoints, sharing junction nodes.
 
     An unreachable waypoint (a disconnected pocket in the graph) doesn't break
@@ -1104,14 +1314,29 @@ def route_contour(grid, dense, waypoints, wp_idx, weight):
     the next leg continues from wherever the route actually ended -- so the
     result is always a connected walk on real edges, never a straight-line
     teleport that would be counted as if it were run.
+
+    flat_frac < 1 turns the constant hugging weight into a feature-hug profile:
+    each leg's deviation weight ramps with the local waypoint_importance of the
+    arc it traces -- full weight near defining corners (a beak tip must be hit
+    and turned at), down to flat_frac of it on featureless stretches, where
+    slavishly hugging the template's raster jitter is what produces staircase.
+    There the anchors alone (never more than max_gap apart) constrain the path
+    and the streets choose the clean line between them. This is the "template,
+    not constraint" reframe applied to the router: adhere at features, delegate
+    the in-between to the street fabric.
     """
+    imp = waypoint_importance(np.asarray(dense)) if flat_frac < 1.0 else None
     route, bridged = [], 0
     cur = waypoints[0]
     for i in range(1, len(waypoints)):
         seg = dense[wp_idx[i - 1]:wp_idx[i] + 1]
         if len(seg) < 2:
             seg = np.array([cur, waypoints[i]])
-        part = route_pair(grid.graph, cur, waypoints[i], seg, weight,
+        w = weight
+        if imp is not None and len(imp):
+            leg_imp = float(imp[wp_idx[i - 1]:wp_idx[i] + 1].max(initial=0.0))
+            w = weight * (flat_frac + (1.0 - flat_frac) * leg_imp)
+        part = route_pair(grid.graph, cur, waypoints[i], seg, w,
                           best_effort=True)
         if not part:
             continue
@@ -1291,10 +1516,8 @@ def on_land(placed, grid, cfg):
 # --------------------------------------------------------------------------- #
 def hausdorff(route, contour):
     """Symmetric Hausdorff distance between two polylines (lower is better)."""
-    r, c = np.asarray(route), np.asarray(contour)
-    dr, _ = cKDTree(c).query(r)
-    dc, _ = cKDTree(r).query(c)
-    return float(max(dr.max(), dc.max()))
+    d_r2c, d_c2r = _two_way_dists(route, contour)
+    return float(max(d_r2c.max(), d_c2r.max()))
 
 
 def frechet(route, contour, samples=140):
@@ -1393,6 +1616,116 @@ def turning_distance(route, contour, samples=180):
     return best
 
 
+def _macro_corners(poly, max_vertices=28, min_turn_deg=25.0):
+    """Significant corners of a closed polyline: (positions, signed turns).
+
+    RDP first (kills staircase jitter, keeps macro structure), then keep the
+    vertices whose turning exceeds `min_turn_deg`. These are the features that
+    carry a figure's identity -- the exact objects the feature ledger audits.
+    """
+    p = simplify_template(_close(np.asarray(poly, dtype=np.float64)), max_vertices)
+    q = p[:-1]
+    if len(q) < 3:
+        return np.zeros((0, 2)), np.zeros(0)
+    e = np.roll(q, -1, axis=0) - q                    # edge i: q_i -> q_{i+1}
+    ang = np.arctan2(e[:, 1], e[:, 0])
+    turn = (ang - np.roll(ang, 1) + np.pi) % (2 * np.pi) - np.pi   # at vertex i
+    keep = np.abs(turn) >= np.radians(min_turn_deg)
+    return q[keep], turn[keep]
+
+
+def feature_ledger(route, placed, pos_tol=0.08, ang_tol_deg=40.0,
+                   pos_tol_abs=None):
+    """Audit the identity-carrying corners: recall / precision / angle error.
+
+    The adherence metrics (IoU/Frechet) cannot see identity: a knight whose
+    snout notch vanishes loses ~0.03 IoU while turning into a blob. This metric
+    asks the question the eye asks -- does every defining corner of the template
+    have a counterpart in the route, and is every macro-corner of the route a
+    real feature rather than an invented one?
+
+      * both curves are reduced to macro-corners (_macro_corners);
+      * corners are matched with a cyclic ORDER-PRESERVING assignment (DP over
+        all start offsets and both windings; skips allowed at a fixed penalty,
+        matches only between same-sign turns -- a notch can't match a bump);
+      * a match is GOOD when position error <= pos_tol x template extent and
+        turn-angle error <= ang_tol_deg;
+      * recall    = turn-magnitude-weighted fraction of template corners with a
+                    good match (a lost 90 deg snout costs more than a lost
+                    25 deg bump);
+      * precision = fraction of route macro-corners that are good matches
+                    (comb teeth and invented zigzags fail this, attributably);
+      * angle_err_deg = mean turn error over good matches.
+
+    Returns dict(recall, precision, f1, angle_err_deg, n_template, n_route).
+    """
+    P, tP = _macro_corners(placed)
+    R0, tR0 = _macro_corners(route)
+    if len(P) == 0:
+        # Corner-free template (a circle): the ledger is vacuous -- there are
+        # no defining corners to lose, so it passes and other metrics judge.
+        return dict(recall=1.0, precision=1.0, f1=1.0, angle_err_deg=0.0,
+                    n_template=0, n_route=len(R0))
+    out = dict(recall=0.0, precision=1.0, f1=0.0, angle_err_deg=180.0,
+               n_template=len(P), n_route=len(R0))
+    if len(R0) == 0:
+        return out                       # corners existed and ALL are missing
+    pl = np.asarray(placed, np.float64)
+    extent = float(max(np.ptp(pl[:, 0]), np.ptp(pl[:, 1]))) or 1.0
+    skip, cap = 0.30, 0.60
+    ang_tol = np.radians(ang_tol_deg)
+    # Resolution fairness: pos_tol scales with the shape, but street
+    # quantization does not -- a corner drawn on a ~100 m block can't sit
+    # closer than ~a block from its ideal spot however small the figure is.
+    # Callers that know the grid pass pos_tol_abs (e.g. 1.5 x avg_edge) and
+    # the effective tolerance is the larger of the two.
+    if pos_tol_abs is not None:
+        pos_tol = max(pos_tol, float(pos_tol_abs) / extent)
+    best = None                                        # (total_cost, pairs, R, tR)
+    for R, tR in ((R0, tR0), (R0[::-1].copy(), -tR0[::-1].copy())):
+        posd = np.linalg.norm(P[:, None, :] - R[None, :, :], axis=2) / extent
+        angd = np.abs(tP[:, None] - tR[None, :])
+        cost = posd + 0.5 * angd / np.pi
+        cost[np.sign(tP)[:, None] != np.sign(tR)[None, :]] = np.inf
+        cost[cost > cap] = np.inf
+        n, m = len(P), len(R)
+        for r in range(m):                             # cyclic start offsets of R
+            c = np.roll(cost, -r, axis=1)
+            dp = np.full((n + 1, m + 1), np.inf)
+            dp[0, :] = np.arange(m + 1) * skip
+            dp[:, 0] = np.arange(n + 1) * skip
+            back = np.zeros((n + 1, m + 1), dtype=np.int8)
+            for i in range(1, n + 1):
+                for j in range(1, m + 1):
+                    a = dp[i - 1, j] + skip            # skip template corner
+                    b = dp[i, j - 1] + skip            # skip route corner
+                    d = dp[i - 1, j - 1] + c[i - 1, j - 1]
+                    dp[i, j], back[i, j] = min((d, 2), (a, 0), (b, 1))
+            if best is None or dp[n, m] < best[0]:
+                pairs, i, j = [], n, m
+                while i > 0 and j > 0:
+                    k = back[i, j]
+                    if k == 2:
+                        pairs.append((i - 1, (j - 1 + r) % m))
+                        i, j = i - 1, j - 1
+                    elif k == 0:
+                        i -= 1
+                    else:
+                        j -= 1
+                best = (float(dp[n, m]), pairs, posd, angd)
+    _, pairs, posd, angd = best
+    good = [(i, j) for i, j in pairs
+            if posd[i, j] <= pos_tol and angd[i, j] <= ang_tol]
+    w = np.abs(tP)
+    out["recall"] = float(sum(w[i] for i, _ in good) / w.sum()) if w.sum() else 0.0
+    out["precision"] = len(good) / len(R0)
+    if good:
+        out["angle_err_deg"] = float(np.degrees(np.mean([angd[i, j] for i, j in good])))
+    r_, p_ = out["recall"], out["precision"]
+    out["f1"] = 2 * r_ * p_ / (r_ + p_) if (r_ + p_) > 0 else 0.0
+    return out
+
+
 def perceptual_cost(route, placed, res=128, blur=4.0):
     """Holistic, blur-tolerant shape distance via low-res render-and-compare.
 
@@ -1436,9 +1769,8 @@ def route_match_cost(route, placed):
       * feature deviation -- the defining points (a thumb tip) are actually visited,
                              so protrusions are credited rather than sacrificed.
     """
-    P, C = np.asarray(route, np.float64), np.asarray(placed, np.float64)
-    d_c2r, _ = cKDTree(P).query(C)        # each shape point -> nearest route point
-    d_r2c, _ = cKDTree(C).query(P)        # each route point -> nearest shape point
+    C = np.asarray(placed, np.float64)
+    d_c2r, d_r2c = _two_way_dists(C, route)   # shape->route, route->shape
     mean_dev = 0.5 * (float(d_c2r.mean()) + float(d_r2c.mean()))
     feat = waypoint_importance(C) > 0.6
     feature_dev = float(d_c2r[feat].mean()) if feat.any() else float(d_c2r.mean())
@@ -1568,6 +1900,12 @@ CONFIG = dict(
     # Street network location (default: midtown Manhattan).
     lat=40.7527,
     lng=-73.9943,
+    # Canvas size. Fidelity ~ blocks-per-shape, and this is its main lever: on
+    # the Chicago snapshot, 1600 -> 2400 alone was worth ~ +0.10 IoU (~3x any
+    # routing change ever measured here), paid in route length (13-22 km at
+    # 2400). Pick by how far you want to run, not by how big a network you can
+    # fetch. (An auto "target_blocks" knob is future work -- see
+    # docs/recognizability-plan.md.)
     radius_m=1600,
     # Optional: path to a saved ox.save_graphml network to load instead of
     # fetching from the Overpass API (offline / reproducible real-map runs).
@@ -1620,10 +1958,33 @@ CONFIG = dict(
     inner_min_span_blocks=6.0,
     inner_max_inflate=3.0,
 
+    # Template simplification (simplify_template). The contour is a template,
+    # not a constraint: keep only the ~template_vertices corners that carry the
+    # figure's identity and let the streets draw clean lines between them,
+    # instead of asking the router to chase thousands of raster-jitter points it
+    # can only render as staircase. Corner-preserving (RDP), so a knight's snout
+    # and a star's tips survive -- measured on real Chicago as part of the
+    # largest fidelity jump this project has recorded (see
+    # docs/recognizability-plan.md). None/0 disables (trace the raw raster).
+    template_vertices=22,
+
     # Placement search.
     scale_range=(0.8, 1.8),   # shape extent as a fraction of the grid span
-    aspect_max=1.5,           # max area-preserving stretch (1.0 = uniform scale)
-    shear_max=0.20,           # max skew, for non-orthogonal grids
+    # Warp caps. Placement search may stretch/shear the template to seat it on
+    # the street fabric -- but a horse stretched 1.5x with 0.2 shear no longer
+    # reads as a horse, however well it traces (and no adherence metric notices,
+    # because they all score against the warped copy). Capped tight by default;
+    # raise for abstract/geometric shapes on strongly anisotropic grids (the
+    # original Manhattan-blocks rationale for the wide caps).
+    aspect_max=1.15,          # max area-preserving stretch (1.0 = uniform scale)
+    shear_max=0.05,           # max skew, for non-orthogonal grids
+    # Rotation cap around the drawn orientation (degrees), None = free spin.
+    # OFF by default: the finished route is map art the viewer can rotate, so
+    # orientation is a display concern, not an identity one -- a "vertical
+    # shark" placement is fine because the print/phone can be turned. Set a
+    # value only when the rendering context has a fixed north (e.g. embedding
+    # in a north-up map next to labels).
+    rot_max=None,
     reflect=True,             # also search mirror-image placements (a shark faces
                               #   either way): doubles the orientations available to
                               #   line the outline up with the streets
@@ -1650,8 +2011,35 @@ CONFIG = dict(
     min_land_fraction=0.85,
     land_reach=2.5,
 
+    # Elastic template bending (bend_template, EXPERIMENTAL, default OFF):
+    # before snapping, deform the placed template onto the street fabric with a
+    # 1-D ARAP solve -- local rotation free, stretch/corner change charged, and
+    # attraction to street-segment projections so stretches settle ALONG block
+    # faces. Physics validated (street distance -40% at ~0.02-0.03 perceptual
+    # change), but end-to-end A/B on Chicago is NEUTRAL: snapping + the
+    # deviation router + cleanup already absorb sub-block mismatch, so a
+    # half-block pre-alignment doesn't change which streets are chosen. The
+    # lever only matters at corridor scale (bending a limb onto a DIFFERENT
+    # street), which is what the v2 defaults below attempt: a much stronger
+    # pull, metered by the identity budget -- annealing stops the moment
+    # feature-ledger recall vs the unbent template drops below bend_min_recall
+    # or the loop stops being simple (a limb folding through itself). bend_pull
+    # is the final attraction strength (annealed over bend_iters);
+    # bend_spacing is the working resolution in avg-edges.
+    bend_template=True,
+    bend_pull=6.0,
+    bend_iters=8,
+    bend_spacing=0.75,
+    bend_min_recall=0.85,
+
     # Routing / fidelity.
     deviation_weight=60.0,    # >> 1 makes "stay on the outline" dominate cost
+    # Feature-hug profile (route_contour): each leg's deviation weight ramps
+    # with the local waypoint_importance -- full hug at defining corners, down
+    # to this fraction on featureless stretches, where the anchors alone
+    # constrain the path and the streets pick the clean line between them.
+    # 1.0 restores the constant-weight hug everywhere.
+    flat_deviation_frac=0.35,
 
     # Granularity: 0.0 = smooth, fewer steps, shorter and easier to run;
     #              1.0 = trace every jog of the shape, longer and more expressive.
@@ -1672,21 +2060,59 @@ CONFIG = dict(
     #               / scales) so you can pick the one whose street angles read best
     #               -- the fix for "every option has the same shallow-angle steps".
     # "detail":     fix the single best placement, vary detail via option_presets.
+    # "engines":    cover the bases -- five INDEPENDENT searches, one per
+    #               ENGINE_PRESETS panel (three classic detail levels for
+    #               elongated/protrusive shapes, the compact recipe, and the
+    #               hybrid middle), presented side by side for the human pick.
     option_mode="placements",
     n_options=3,
-    option_presets={
-        "efficient": dict(granularity=0.65, deviation_weight=1.0),
-        "simple":    dict(granularity=0.35),
-        "faithful":  dict(granularity=0.90),
-    },
+    option_presets=None,      # None -> DETAIL_PRESETS (the single source of truth)
 
     # How far (in avg-edge lengths) the route may stray from the shape before an
     # out-and-back / loop is treated as an artifact instead of a real protrusion
     # (beak, leg, tail). Higher = more forgiving of genuine thin features.
     protrusion_tolerance=2.5,
 
+    # Engine dispatch (_dispatch_engine). The two engine families have opposite
+    # measured strengths: the compact recipe wins on blob shapes (identity in a
+    # few notches), the classic engine wins on elongated/protrusive shapes
+    # (limbs need the full hug and free warp). "auto" picks per shape by
+    # shape_compactness (<= compact_max_ipq -> recipe, else classic); an
+    # explicit ENGINE_PRESETS name forces that engine; None disables dispatch.
+    engine="auto",
+    compact_max_ipq=2.0,
+
     seed=42,
 )
+
+# The three classic detail levels -- the single source for both
+# option_mode="detail" (cheap re-renders of the chosen placement) and the
+# classic-* panels of option_mode="engines" below.
+DETAIL_PRESETS = {
+    "efficient": dict(granularity=0.65, deviation_weight=1.0),
+    "simple":    dict(granularity=0.35),
+    "faithful":  dict(granularity=0.90),
+}
+
+# Engine presets: complete knob bundles for the two measured engine families
+# plus the coverage panels of option_mode="engines". "classic" reproduces
+# main's engine (raw template, constant hug, free warp) and respects the
+# user's granularity; the three classic-* variants pin the detail level;
+# "recipe" is this branch's compact engine (RDP template + elastic bend with
+# the identity budget + tight warp caps + feature-hug); "hybrid" is the middle
+# ground -- simplified template and relaxed flats, but classic seating freedom
+# and no bend.
+_CLASSIC = dict(template_vertices=None, bend_template=False,
+                flat_deviation_frac=1.0, aspect_max=1.5, shear_max=0.20)
+ENGINE_PRESETS = {
+    "classic": dict(_CLASSIC),
+    **{f"classic-{k}": {**_CLASSIC, **v} for k, v in DETAIL_PRESETS.items()},
+    "recipe":  {},
+    "hybrid":  dict(bend_template=False, aspect_max=1.5, shear_max=0.20),
+}
+# The five side-by-side panels of option_mode="engines".
+ENGINE_PANELS = ["classic-faithful", "classic-simple", "classic-efficient",
+                 "recipe", "hybrid"]
 
 
 def main(cfg=CONFIG):
@@ -1699,9 +2125,23 @@ def main(cfg=CONFIG):
         print(f"inner features: {len(spec.inners)} "
               f"({len(spec.inners) - n_open} closed loop(s), {n_open} open path(s))")
     inners = spec.inners if cfg.get("inner_features", True) else []
+    save, show = cfg.get("save_plot"), cfg.get("show_plot", True)
+
+    if cfg.get("present_options") and cfg["option_mode"] == "engines":
+        # Cover the bases: one INDEPENDENT search per engine panel (each engine
+        # wants its own placement -- warp caps and template differ), human picks.
+        panels = []
+        for name in ENGINE_PANELS:
+            c2 = {**cfg, **ENGINE_PRESETS[name], "engine": name}
+            panels.append((name, search_placement(contour, grid, c2,
+                                                  inners=inners)[0]))
+        for label, cand in panels:
+            _report(label, grid, cand)
+        plot_options(grid, panels, save=save, show=show)
+        return [cand for _, cand in panels]
+
     ranked = search_placement(contour, grid, cfg, inners=inners)   # [Candidate, ...]
     best = ranked[0]
-    save, show = cfg.get("save_plot"), cfg.get("show_plot", True)
 
     if not cfg.get("present_options"):
         _report("route", grid, best)
@@ -1714,7 +2154,7 @@ def main(cfg=CONFIG):
                   for i, c in enumerate(ranked[:cfg["n_options"]])]
     else:  # "detail": fix the best placement, vary detail
         panels = []
-        for name, ov in cfg["option_presets"].items():
+        for name, ov in (cfg.get("option_presets") or DETAIL_PRESETS).items():
             c2 = {**cfg, **ov}
             feats = [(f, fp, build_feature_route(grid, fp, f.closed, c2))
                      for f, fp, _ in best.feats]
