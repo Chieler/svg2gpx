@@ -337,6 +337,19 @@ def _arc_len(pts):
                                 axis=1).sum())
 
 
+def _outer_outline(binary, img_size, svg_path):
+    """Solidify interior holes, trace the largest external contour, return it
+    as a closed [0, 1] polyline (the shared core of extract_shape/contour)."""
+    holes = binary.copy()
+    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
+    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
+    ext, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not ext:
+        raise ValueError(f"no drawable outline found in {svg_path!r} "
+                         "(empty or unsupported SVG)")
+    return _close(_norm_pts(max(ext, key=cv2.contourArea)[:, 0, :], img_size))
+
+
 def extract_shape(svg_path, img_size, min_perimeter=0.05, dup_tol=None):
     """Render the SVG and extract the outer outline AND its inner features.
 
@@ -371,14 +384,7 @@ def extract_shape(svg_path, img_size, min_perimeter=0.05, dup_tol=None):
 
     # Outer outline: identical to the historical behaviour (solidify, then the
     # largest external contour).
-    holes = binary.copy()
-    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
-    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
-    ext, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not ext:
-        raise ValueError(f"no drawable outline found in {svg_path!r} "
-                         "(empty or unsupported SVG)")
-    outer = _close(_norm_pts(max(ext, key=cv2.contourArea)[:, 0, :], img_size))
+    outer = _outer_outline(binary, img_size, svg_path)
 
     # Full boundary tree of the raw ink mask, at pixel density.
     contours, hier = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
@@ -467,19 +473,7 @@ def extract_contour(svg_path, img_size):
     projected street grid. (Outline only -- use extract_shape() to also get the
     inner features.)
     """
-    binary = _render_ink_mask(svg_path, img_size)
-
-    # Flood from a corner then OR back in, so interior holes are treated as solid.
-    holes = binary.copy()
-    cv2.floodFill(holes, np.zeros((img_size + 2, img_size + 2), np.uint8), (0, 0), 255)
-    solid = cv2.bitwise_or(binary, cv2.bitwise_not(holes))
-
-    contours, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ValueError(f"no drawable outline found in {svg_path!r} "
-                         "(empty or unsupported SVG)")
-    outer = max(contours, key=cv2.contourArea)
-    return _close(_norm_pts(outer[:, 0, :], img_size))
+    return _outer_outline(_render_ink_mask(svg_path, img_size), img_size, svg_path)
 
 
 
@@ -492,6 +486,19 @@ def _close(pts):
     if not np.allclose(pts[0], pts[-1]):
         pts = np.vstack([pts, pts[0]])
     return pts
+
+
+def _rot(a):
+    """2x2 rotation matrix for angle `a` (radians)."""
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s], [s, c]])
+
+
+def _two_way_dists(a, b):
+    """(distance from each a-point to b, distance from each b-point to a)."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return cKDTree(b).query(a)[0], cKDTree(a).query(b)[0]
 
 
 def resample(pts, n=None, step=None, closed=True):
@@ -535,8 +542,7 @@ def place(pts, scale, rot_deg, dx, dy, aspect=1.0, shear=0.0, flip=False,
     """
     pts = np.asarray(pts, dtype=np.float64)
     c = np.asarray(center, dtype=np.float64) if center is not None else pts.mean(axis=0)
-    a = np.radians(rot_deg)
-    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    R = _rot(np.radians(rot_deg))
     H = np.array([[1.0, shear], [0.0, 1.0]])
     sx = -1.0 if flip else 1.0                      # mirror across the vertical axis
     Sc = np.array([[scale * aspect * sx, 0.0], [0.0, scale / aspect]])
@@ -795,18 +801,22 @@ def _placement_far(a, b, drot=22.0, doff=0.12, dscale=0.15, daspect=0.2):
             or abs(a1 - a2) > daspect)
 
 
+def _route_polyline(grid, placed, cfg, closed=True, flat_frac=1.0):
+    """Shared snap -> route -> cleanup core for outer contours and features."""
+    dense, waypoints, wp_idx = snap_waypoints(placed, grid, cfg, closed=closed)
+    if len(waypoints) < (3 if closed else 2):
+        return [], dense, waypoints
+    w = cfg["deviation_weight"]
+    route = route_contour(grid, dense, waypoints, wp_idx, w, flat_frac=flat_frac)
+    return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed), dense, waypoints
+
+
 def build_route(grid, placed, cfg):
     """Run the full snap -> route -> cleanup pipeline for one placement."""
     if cfg.get("bend_template", True):
         placed = bend_template(placed, grid, cfg)
-    dense, waypoints, wp_idx = snap_waypoints(placed, grid, cfg)
-    if len(waypoints) < 3:
-        return [], dense, waypoints
-    w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w,
-                          flat_frac=cfg.get("flat_deviation_frac", 1.0))
-    route = cleanup(grid, route, dense, wp_idx, w, cfg)
-    return route, dense, waypoints
+    return _route_polyline(grid, placed, cfg, closed=True,
+                           flat_frac=cfg.get("flat_deviation_frac", 1.0))
 
 
 @dataclass
@@ -839,20 +849,14 @@ def build_feature_route(grid, placed_feat, closed, cfg):
     if full > 0 and 0.12 * span < full * (1.0 - g) ** 0.6:
         g_feat = 1.0 - (0.12 * span / full) ** (1.0 / 0.6)
         cfg = {**cfg, "granularity": float(np.clip(g_feat, g, 1.0))}
-    dense, waypoints, wp_idx = snap_waypoints(placed_feat, grid, cfg, closed=closed)
-    if len(waypoints) < (3 if closed else 2):
-        return []
-    w = cfg["deviation_weight"]
-    route = route_contour(grid, dense, waypoints, wp_idx, w)
-    return cleanup(grid, route, dense, wp_idx, w, cfg, close=closed)
+    # Features keep the full hug (flat_frac 1.0): they are all feature.
+    return _route_polyline(grid, placed_feat, cfg, closed=closed)[0]
 
 
 def _feat_deviation(route, target):
     """Mean two-way deviation between a feature's route and its target."""
-    r = np.asarray(route, np.float64)
-    t = np.asarray(target, np.float64)
-    return 0.5 * (float(cKDTree(r).query(t)[0].mean())
-                  + float(cKDTree(t).query(r)[0].mean()))
+    d_t2r, d_r2t = _two_way_dists(target, route)
+    return 0.5 * (float(d_t2r.mean()) + float(d_r2t.mean()))
 
 
 def refine_feature(grid, fp0, closed, cfg):
@@ -905,7 +909,7 @@ def refine_feature(grid, fp0, closed, cfg):
     rescue = max(scales) if span < min_span else None
     scored = []
     for a in rots:
-        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        R = _rot(a)
         rotated = proxy_pts @ R.T
         for s in sorted(scales):
             base = rotated * s
@@ -937,7 +941,7 @@ def refine_feature(grid, fp0, closed, cfg):
 
     best = None
     for proxy, a, s, c, drift in chosen:
-        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        R = _rot(a)
         fp = (fp0 - c0) @ R.T * s + c
         fr = build_feature_route(grid, fp, closed, cfg)
         if len(fr) < 2:
@@ -1512,10 +1516,8 @@ def on_land(placed, grid, cfg):
 # --------------------------------------------------------------------------- #
 def hausdorff(route, contour):
     """Symmetric Hausdorff distance between two polylines (lower is better)."""
-    r, c = np.asarray(route), np.asarray(contour)
-    dr, _ = cKDTree(c).query(r)
-    dc, _ = cKDTree(r).query(c)
-    return float(max(dr.max(), dc.max()))
+    d_r2c, d_c2r = _two_way_dists(route, contour)
+    return float(max(d_r2c.max(), d_c2r.max()))
 
 
 def frechet(route, contour, samples=140):
@@ -1668,8 +1670,8 @@ def feature_ledger(route, placed, pos_tol=0.08, ang_tol_deg=40.0,
                n_template=len(P), n_route=len(R0))
     if len(R0) == 0:
         return out                       # corners existed and ALL are missing
-    extent = float(max(np.ptp(np.asarray(placed, np.float64)[:, 0]),
-                       np.ptp(np.asarray(placed, np.float64)[:, 1]))) or 1.0
+    pl = np.asarray(placed, np.float64)
+    extent = float(max(np.ptp(pl[:, 0]), np.ptp(pl[:, 1]))) or 1.0
     skip, cap = 0.30, 0.60
     ang_tol = np.radians(ang_tol_deg)
     # Resolution fairness: pos_tol scales with the shape, but street
@@ -1767,9 +1769,8 @@ def route_match_cost(route, placed):
       * feature deviation -- the defining points (a thumb tip) are actually visited,
                              so protrusions are credited rather than sacrificed.
     """
-    P, C = np.asarray(route, np.float64), np.asarray(placed, np.float64)
-    d_c2r, _ = cKDTree(P).query(C)        # each shape point -> nearest route point
-    d_r2c, _ = cKDTree(C).query(P)        # each route point -> nearest shape point
+    C = np.asarray(placed, np.float64)
+    d_c2r, d_r2c = _two_way_dists(C, route)   # shape->route, route->shape
     mean_dev = 0.5 * (float(d_c2r.mean()) + float(d_r2c.mean()))
     feat = waypoint_importance(C) > 0.6
     feature_dev = float(d_c2r[feat].mean()) if feat.any() else float(d_c2r.mean())
@@ -2065,11 +2066,7 @@ CONFIG = dict(
     #               hybrid middle), presented side by side for the human pick.
     option_mode="placements",
     n_options=3,
-    option_presets={
-        "efficient": dict(granularity=0.65, deviation_weight=1.0),
-        "simple":    dict(granularity=0.35),
-        "faithful":  dict(granularity=0.90),
-    },
+    option_presets=None,      # None -> DETAIL_PRESETS (the single source of truth)
 
     # How far (in avg-edge lengths) the route may stray from the shape before an
     # out-and-back / loop is treated as an artifact instead of a real protrusion
@@ -2088,6 +2085,15 @@ CONFIG = dict(
     seed=42,
 )
 
+# The three classic detail levels -- the single source for both
+# option_mode="detail" (cheap re-renders of the chosen placement) and the
+# classic-* panels of option_mode="engines" below.
+DETAIL_PRESETS = {
+    "efficient": dict(granularity=0.65, deviation_weight=1.0),
+    "simple":    dict(granularity=0.35),
+    "faithful":  dict(granularity=0.90),
+}
+
 # Engine presets: complete knob bundles for the two measured engine families
 # plus the coverage panels of option_mode="engines". "classic" reproduces
 # main's engine (raw template, constant hug, free warp) and respects the
@@ -2099,12 +2105,10 @@ CONFIG = dict(
 _CLASSIC = dict(template_vertices=None, bend_template=False,
                 flat_deviation_frac=1.0, aspect_max=1.5, shear_max=0.20)
 ENGINE_PRESETS = {
-    "classic":           dict(_CLASSIC),
-    "classic-faithful":  {**_CLASSIC, "granularity": 0.90},
-    "classic-simple":    {**_CLASSIC, "granularity": 0.35},
-    "classic-efficient": {**_CLASSIC, "granularity": 0.65, "deviation_weight": 1.0},
-    "recipe":            {},
-    "hybrid":            dict(bend_template=False, aspect_max=1.5, shear_max=0.20),
+    "classic": dict(_CLASSIC),
+    **{f"classic-{k}": {**_CLASSIC, **v} for k, v in DETAIL_PRESETS.items()},
+    "recipe":  {},
+    "hybrid":  dict(bend_template=False, aspect_max=1.5, shear_max=0.20),
 }
 # The five side-by-side panels of option_mode="engines".
 ENGINE_PANELS = ["classic-faithful", "classic-simple", "classic-efficient",
@@ -2150,7 +2154,7 @@ def main(cfg=CONFIG):
                   for i, c in enumerate(ranked[:cfg["n_options"]])]
     else:  # "detail": fix the best placement, vary detail
         panels = []
-        for name, ov in cfg["option_presets"].items():
+        for name, ov in (cfg.get("option_presets") or DETAIL_PRESETS).items():
             c2 = {**cfg, **ov}
             feats = [(f, fp, build_feature_route(grid, fp, f.closed, c2))
                      for f, fp, _ in best.feats]
