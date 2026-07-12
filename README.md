@@ -8,7 +8,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/License-MIT-2ea44f" alt="License: MIT">
-  <a href="https://github.com/Chieler/svg2gpx/actions/workflows/best-route.yml"><img src="https://github.com/Chieler/svg2gpx/actions/workflows/best-route.yml/badge.svg" alt="Best Route CI"></a>
   <img src="https://img.shields.io/badge/PRs-welcome-ff69b4" alt="PRs welcome">
   <img src="https://img.shields.io/badge/built%20with-NumPy%20·%20SciPy%20·%20Shapely%20·%20OSMnx-f7931e" alt="Built with NumPy, SciPy, Shapely, OSMnx">
 </p>
