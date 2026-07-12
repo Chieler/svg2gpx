@@ -1,13 +1,22 @@
-# Spatial Shape Fidelity Mapping on Street Networks
+# svg2gpx — SVG to GPS art running route generator
 
-> Turn an SVG into a runnable city route whose outline traces the shape on real streets.
+> Turn any **SVG** shape into a runnable **GPS art** route that traces the figure on
+> real city streets — the automatic, open-source way to make **Strava art** without
+> drawing it by hand.
 
-Given an SVG silhouette and a location, this project lays the shape over a city's
-walkable street network and builds a single **closed running route** whose path
-resembles the shape — a boar, a star, a heart — drawn in streets you can actually run.
+**svg2gpx** takes an SVG silhouette and a location, lays the shape over a city's
+walkable street network, and generates a single **closed running route** whose path
+resembles the shape — a boar, a star, a heart — drawn in streets you can actually run
+or ride. Unlike the hand-draw GPS art planners, it fits and routes the shape
+**automatically**, and it ships a **fidelity engine** that measures how faithfully the
+route reproduces your shape — so quality is a number you can track and tune, not just
+something you eyeball.
 
-It then **measures how faithfully** the route reproduces the shape, so fidelity is a
-number you can track and tune, not just something you eyeball.
+Routes export as GeoJSON (WGS84) plus map images today; a one-hop conversion to **GPX**
+drops them straight into **Strava**, **Garmin**, or **Komoot**.
+
+<sub>*Topics: GPS art · Strava art generator · GPS drawing · SVG to GPX · SVG to route ·
+running route art · GPX route maker · OpenStreetMap · running · cycling.*</sub>
 
 ---
 
