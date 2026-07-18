@@ -22,8 +22,8 @@ import os
 
 import numpy as np
 
-import gen
-from gen import (
+from . import gen
+from .gen import (
     dtw,
     extract_contour,
     format_distance,
@@ -36,9 +36,7 @@ from gen import (
     search_placement,
     turning_distance,
 )
-from benchmark import SHAPES_DIR, real_grid_cached, synthetic_grid
-
-HERE = os.path.dirname(os.path.abspath(__file__))
+from .benchmark import SHAPES_DIR, real_grid_cached, synthetic_grid
 
 # How many top-ranked candidate placements to route and choose the best from.
 N_BEST = 3
@@ -121,7 +119,7 @@ def main():
     ap.add_argument("--grid-size", type=int, default=50,
                     help="synthetic lattice resolution (nodes per side)")
     ap.add_argument("--shapes", default=SHAPES_DIR, help="directory of *.svg shapes")
-    ap.add_argument("--out", default=os.path.join(HERE, "result.csv"),
+    ap.add_argument("--out", default="result.csv",
                     help="result CSV path")
     args = ap.parse_args()
 

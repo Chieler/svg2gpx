@@ -19,10 +19,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from gen import _render_ink_mask, extract_shape
+from .gen import _render_ink_mask, extract_shape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHAPES_DIR = os.path.join(HERE, "shapes")
+SHAPES_DIR = os.path.join(HERE, "shapes")   # bundled read-only package data
 
 
 def main():
@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--shape", action="append",
                     help="shape stem(s) to preview (default: all)")
     ap.add_argument("--img-size", type=int, default=1024)
-    ap.add_argument("--out", default=os.path.join(HERE, "inner_features_preview.png"))
+    ap.add_argument("--out", default="inner_features_preview.png")
     args = ap.parse_args()
 
     if args.shape:

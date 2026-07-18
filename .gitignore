@@ -7,3 +7,8 @@ benchmark_results.json
 __pycache__/
 *.pyc
 data/
+
+# Packaging build artifacts
+*.egg-info/
+dist/
+build/

@@ -32,6 +32,8 @@ import numpy as np
 import cv2
 import skia
 from scipy.spatial import cKDTree
+
+from .shapes import shape_path
 from shapely.geometry import LinearRing, LineString
 
 # osmnx (live OSM fetch) and matplotlib (plotting) are imported lazily inside the
@@ -58,6 +60,8 @@ class Grid:
     x_min: float
     y_min: float
     grid_angle: float    # dominant street orientation, radians (period 90 deg)
+    crs: str = None      # the source graph's projected CRS, for to_lonlat();
+                         # None on the synthetic grid (no real-world location)
 
 
 def build_grid(cfg):
@@ -80,6 +84,24 @@ def build_grid(cfg):
         G = ox.graph_from_point((cfg["lat"], cfg["lng"]), dist=cfg["radius_m"],
                                 network_type="walk", simplify=True)
     return grid_from_graph(ox.project_graph(G), cfg)
+
+
+def to_lonlat(pts01, grid):
+    """[0, 1] pipeline coords -> WGS84 (lat, lon) pairs, for GPX/GeoJSON export.
+
+    Only meaningful for a grid built from a real network (grid.crs set by
+    build_grid/grid_from_graph); the synthetic benchmark grid has no
+    real-world location and raises.
+    """
+    if not grid.crs:
+        raise ValueError("this grid has no CRS (synthetic grid?) -- "
+                         "geographic export needs a real-network grid")
+    from pyproj import Transformer
+    pts = np.asarray(pts01, dtype=np.float64)
+    proj = pts * grid.span + np.array([grid.x_min, grid.y_min])
+    tf = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+    lon, lat = tf.transform(proj[:, 0], proj[:, 1])
+    return np.column_stack([lat, lon])
 
 
 def grid_from_graph(G_proj, cfg):
@@ -143,7 +165,8 @@ def grid_from_graph(G_proj, cfg):
     print(f"grid: {len(node_keys)} nodes, {len(edge_list)} edges, "
           f"avg edge {avg_edge:.4f}, grid angle {np.degrees(grid_angle):.1f} deg")
     return Grid(graph, node_keys, nodes_arr, cKDTree(nodes_arr),
-                avg_edge, edge_list, span, x_min, y_min, grid_angle)
+                avg_edge, edge_list, span, x_min, y_min, grid_angle,
+                crs=str(G_proj.graph["crs"]))
 
 
 def _dominant_orientation(edge_list, sample=6000):
@@ -1896,7 +1919,7 @@ def _report(label, grid, cand):
 # CONFIG                                                                       #
 # --------------------------------------------------------------------------- #
 CONFIG = dict(
-    svg_path="shapes/star.svg",   # any of the bundled shapes/*.svg, or your own
+    svg_path=shape_path("star"),  # a bundled stem, or a path to your own SVG
     # Street network location (default: midtown Manhattan).
     lat=40.7527,
     lng=-73.9943,
@@ -2116,6 +2139,11 @@ ENGINE_PANELS = ["classic-faithful", "classic-simple", "classic-efficient",
 
 
 def main(cfg=CONFIG):
+    """Run the full pipeline. Returns (grid, candidates) -- candidates is the
+    ranked Candidate list (or, in "engines" mode, one per engine panel), and
+    grid is included so callers (e.g. the CLI's --gpx export) can convert a
+    candidate's route to real-world coordinates via to_lonlat() without
+    re-running the placement search."""
     grid = build_grid(cfg)
     spec = extract_shape(cfg["svg_path"], cfg["img_size"],
                          min_perimeter=cfg["inner_min_perimeter"])
@@ -2138,7 +2166,7 @@ def main(cfg=CONFIG):
         for label, cand in panels:
             _report(label, grid, cand)
         plot_options(grid, panels, save=save, show=show)
-        return [cand for _, cand in panels]
+        return grid, [cand for _, cand in panels]
 
     ranked = search_placement(contour, grid, cfg, inners=inners)   # [Candidate, ...]
     best = ranked[0]
@@ -2146,7 +2174,7 @@ def main(cfg=CONFIG):
     if not cfg.get("present_options"):
         _report("route", grid, best)
         plot(grid, best.placed, best.route, feats=best.feats, save=save, show=show)
-        return ranked
+        return grid, ranked
 
     if cfg["option_mode"] == "placements":
         # Different placements per panel -- pick the one whose street angles read best.
@@ -2165,7 +2193,7 @@ def main(cfg=CONFIG):
     for label, cand in panels:
         _report(label, grid, cand)
     plot_options(grid, panels, save=save, show=show)
-    return ranked
+    return grid, ranked
 
 
 def _cli(argv=None):
@@ -2173,7 +2201,8 @@ def _cli(argv=None):
     Chicago and save the plot' needs no source edits."""
     import argparse
     ap = argparse.ArgumentParser(description="SVG -> running route on real streets.")
-    ap.add_argument("--svg", help="path to the shape SVG")
+    ap.add_argument("--svg", help="a bundled shape stem (e.g. 'star') or a path "
+                                  "to your own SVG")
     ap.add_argument("--lat", type=float, help="network center latitude")
     ap.add_argument("--lng", type=float, help="network center longitude")
     ap.add_argument("--radius", type=float, dest="radius_m",
@@ -2192,6 +2221,8 @@ def _cli(argv=None):
     args = ap.parse_args(argv)
 
     cfg = dict(CONFIG)
+    if args.svg is not None:
+        args.svg = shape_path(args.svg)
     for key, val in [("svg_path", args.svg), ("lat", args.lat), ("lng", args.lng),
                      ("radius_m", args.radius_m), ("graphml_path", args.graphml),
                      ("granularity", args.granularity), ("seed", args.seed),

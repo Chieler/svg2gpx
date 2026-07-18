@@ -39,17 +39,18 @@ jobs:
       - name: Install system libraries (skia)
         run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
 
-      - name: Install Python dependencies
+      - name: Install svg2gpx
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
           if [ "${{ inputs.grid }}" = "real" ]; then
-            pip install -r requirements-osm.txt
+            pip install -e ".[osm]"
+          else
+            pip install -e .
           fi
 
       - name: Compute best route(s)
         run: |
-          python best_route.py \
+          python -m svg2gpx.best_route \
             --shape "${{ inputs.shape }}" \
             --grid "${{ inputs.grid }}" \
             --grid-size "${{ inputs.grid_size }}" \

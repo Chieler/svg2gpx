@@ -28,8 +28,8 @@ the shape automatically**, and it ships a **fidelity engine** that measures how
 faithfully the route reproduces your shape — so quality is a number you can track
 and tune, not just something you eyeball.
 
-Routes export as GeoJSON (WGS84) plus map images today; a one-hop conversion to
-**GPX** drops them straight into **Strava**, **Garmin**, or **Komoot**.
+Routes export as **GPX** (ready for **Strava**, **Garmin**, or **Komoot**),
+GeoJSON (WGS84), and map images.
 
 ## ✨ Why svg2gpx
 
@@ -54,8 +54,8 @@ Routes export as GeoJSON (WGS84) plus map images today; a one-hop conversion to
 git clone https://github.com/Chieler/svg2gpx.git
 cd svg2gpx
 
-pip install -r requirements.txt        # core: synthetic-grid runs, offline
-pip install -r requirements-osm.txt    # extra: real OpenStreetMap data + plotting
+pip install -e .            # core: synthetic-grid runs, offline
+pip install -e ".[osm]"     # + real OpenStreetMap data & plotting
 ```
 
 `skia-python` needs system GL libraries on Linux:
@@ -64,11 +64,15 @@ pip install -r requirements-osm.txt    # extra: real OpenStreetMap data + plotti
 sudo apt-get install -y libegl1 libgl1
 ```
 
-Generate your first route:
+Generate your first route and export it as GPX:
 
 ```bash
-python gen.py --svg shapes/star.svg --lat 41.9285 --lng -87.7075 --save star.png
+svg2gpx --svg star --lat 41.9285 --lng -87.7075 --save star.png --gpx star.gpx
 ```
+
+`--svg` takes any [bundled shape](#-shapes) stem (`star`, `Horse`, `donut`, …) or
+a path to your own SVG. `star.gpx` is ready to import into Strava, Garmin, or
+Komoot.
 
 ## 🖼️ Gallery
 
@@ -122,24 +126,25 @@ corners landed (turning distance, feature ledger).
 <summary><b>Generate a route</b></summary>
 
 ```bash
-python gen.py                                       # CONFIG defaults
-python gen.py --svg shapes/Crow.svg --granularity 0.8
-python gen.py --lat 41.9285 --lng -87.7075 --save route.png --no-show
+svg2gpx                                             # CONFIG defaults
+svg2gpx --svg Crow --granularity 0.8
+svg2gpx --svg star --lat 41.9285 --lng -87.7075 --save route.png --gpx route.gpx --no-show
 ```
 
 Common knobs are CLI flags (`--svg`, `--lat/--lng/--radius`, `--granularity`,
-`--graphml`, `--seed`, `--save`, `--no-show`, `--no-inner-features`); everything
-else is tuned from the `CONFIG` dict in `gen.py`. `--graphml` loads a saved OSMnx
-network for offline / reproducible runs.
+`--graphml`, `--seed`, `--save`, `--gpx`, `--no-show`, `--no-inner-features`);
+everything else is tuned from `svg2gpx.CONFIG`. `--graphml` loads a saved OSMnx
+network for offline / reproducible runs. `python -m svg2gpx` works identically
+to the `svg2gpx` command.
 </details>
 
 <details>
 <summary><b>Trace every shape on the real Chicago map</b></summary>
 
 ```bash
-python chicago_map.py                 # all shapes, Logan Square window
-python chicago_map.py --shape star    # one shape
-python chicago_map.py --live          # fetch fresh OSM data instead
+python -m svg2gpx.chicago_map                 # all shapes, Logan Square window
+python -m svg2gpx.chicago_map --shape star    # one shape
+python -m svg2gpx.chicago_map --live          # fetch fresh OSM data instead
 ```
 
 Renders each route on the real OSMnx map plus a gallery image, and writes per-shape
@@ -150,10 +155,10 @@ GeoJSON (WGS84) and a metrics CSV to `chicago_maps/`.
 <summary><b>Benchmark fidelity across shapes</b></summary>
 
 ```bash
-python benchmark.py                 # synthetic grid, all shapes (offline, CI-friendly)
-python benchmark.py --grid-size 60  # finer lattice
-python benchmark.py --real          # real OSM (cached on disk)
-python benchmark.py --json          # also write benchmark_results.json
+python -m svg2gpx.benchmark                 # synthetic grid, all shapes (offline, CI-friendly)
+python -m svg2gpx.benchmark --grid-size 60  # finer lattice
+python -m svg2gpx.benchmark --real          # real OSM (cached on disk)
+python -m svg2gpx.benchmark --json          # also write benchmark_results.json
 ```
 </details>
 
@@ -161,9 +166,9 @@ python benchmark.py --json          # also write benchmark_results.json
 <summary><b>Pick the best route per shape</b></summary>
 
 ```bash
-python best_route.py                # all shapes, synthetic grid
-python best_route.py --shape star   # just one shape
-python best_route.py --grid real    # real OSM
+python -m svg2gpx.best_route                # all shapes, synthetic grid
+python -m svg2gpx.best_route --shape star   # just one shape
+python -m svg2gpx.best_route --grid real    # real OSM
 ```
 
 Routes the top candidate placements, selects the lowest-cost one, and upserts its
@@ -172,11 +177,11 @@ metrics into [`result.csv`](result.csv) — one "best route" row per shape.
 
 ## 🧩 Shapes
 
-Eighteen SVGs live in [`shapes/`](shapes) — animals (`Horse`, `Shark`, `Crow`,
-`Cat`, `pig`, `duck`, `whale`, `ghost`), figures (`Knight`, `Pawn`, `face`), and
-geometric primitives (`square`, `circle`, `star`, `heart`, `donut`, `mushroom`,
-`lshape`). Drop any `<polygon>` / `<path>` SVG in there and the benchmark, Action
-and Chicago map pick it up automatically — no code changes.
+Eighteen SVGs ship with the package (see [`src/svg2gpx/shapes/`](src/svg2gpx/shapes))
+— animals (`Horse`, `Shark`, `Crow`, `Cat`, `pig`, `duck`, `whale`, `ghost`), figures
+(`Knight`, `Pawn`, `face`), and geometric primitives (`square`, `circle`, `star`,
+`heart`, `donut`, `mushroom`, `lshape`). Pass any of these as a bare `--svg` stem, or
+point `--svg` at your own SVG file — no code changes needed either way.
 
 ### Inner features
 
@@ -191,43 +196,50 @@ Placement folds each candidate's **feature fidelity into its cost**, so a route 
 seats the body nicely but strands the eye ranks below one that draws both. Small
 features get extra rescues (feature-scaled smoothing and per-feature re-seating on
 the local street fabric). Toggle with `inner_features=False` or `--no-inner-features`.
-Visual check: `python preview_features.py`.
+Visual check: `python -m svg2gpx.preview_features`.
 
 ## 📊 Continuous fidelity tracking
 
 The **Best Route** GitHub Action
 ([`.github/workflows/best-route.yml`](.github/workflows/best-route.yml)) runs
-`best_route.py` on demand (`workflow_dispatch`) and commits the updated `result.csv`
-back to the repo, so fidelity is tracked over time.
+`svg2gpx.best_route` on demand (`workflow_dispatch`) and commits the updated
+`result.csv` back to the repo, so fidelity is tracked over time.
 
 ## 🗺️ Roadmap
 
-- [ ] **GPX export** — make the name literal: one flag to write `.gpx` for Strava / Garmin / Komoot.
-- [ ] **PyPI package** — `pip install svg2gpx` + a proper `svg2gpx` CLI.
+- [x] **GPX export** — `--gpx route.gpx` writes a Strava / Garmin / Komoot-ready track.
+- [ ] **PyPI package** — `pip install svg2gpx`.
 - [ ] **Walk-network resolution** — alleys and footpaths for ~2× finer routes.
 - [ ] **Semantic recognizability judge** — a sketch classifier as a dev-time oracle.
 
 ## 📦 Repository layout
 
 ```
-gen.py               # the full SVG -> street-route pipeline + fidelity metrics
-chicago_map.py       # route every shape on the real Chicago OSM network
-benchmark.py         # fidelity + runtime benchmark over all shapes
-best_route.py        # best-of-N selection -> result.csv
-preview_features.py  # visualize extracted inner features
-shapes/              # sample input SVGs
-docs/                # design notes and comparison figures
-.github/workflows/   # Best Route GitHub Action
+pyproject.toml              # package metadata, the svg2gpx console entry point
+src/svg2gpx/
+  gen.py                    # the full SVG -> street-route pipeline + fidelity metrics
+  cli.py                    # the svg2gpx command (CONFIG overrides + --gpx)
+  gpx.py                    # GPX 1.1 export
+  chicago_map.py            # route every shape on the real Chicago OSM network
+  benchmark.py              # fidelity + runtime benchmark over all shapes
+  best_route.py             # best-of-N selection -> result.csv
+  preview_features.py       # visualize extracted inner features
+  shapes/                   # bundled sample SVGs (package data)
+tests/                       # routing + inner-feature checks
+docs/                        # design notes and comparison figures
+.github/workflows/           # Best Route GitHub Action
 ```
 
 ## 🤝 Contributing
 
-Issues and PRs are welcome. Before opening a PR, run the checks:
+Issues and PRs are welcome. Before opening a PR:
 
 ```bash
-python test_routing.py          # routing / connectivity
-python test_inner_features.py   # inner-feature extraction
-python benchmark.py             # fidelity smoke on the synthetic grid
+pip install -e ".[osm,dev]"
+
+python tests/test_routing.py          # routing / connectivity
+python tests/test_inner_features.py   # inner-feature extraction
+python -m svg2gpx.benchmark           # fidelity smoke on the synthetic grid
 ```
 
 ## 📄 License

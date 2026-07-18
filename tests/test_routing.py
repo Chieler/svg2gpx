@@ -9,9 +9,10 @@ disconnected graph, and an end-to-end pipeline smoke on the synthetic lattice.
 import numpy as np
 from scipy.spatial import cKDTree
 
-import gen
-from gen import Grid, route_contour, route_pair, search_placement
-from benchmark import synthetic_grid
+from svg2gpx import gen
+from svg2gpx.gen import Grid, route_contour, route_pair, search_placement
+from svg2gpx.benchmark import synthetic_grid
+from svg2gpx.shapes import shape_path
 
 
 def check(cond, msg):
@@ -83,7 +84,7 @@ def main():
     cfg.update(grid_size=30, grid_diagonals=True, n_random=300, n_refine=100,
                n_route_eval=2, inner_features=False)
     lattice = synthetic_grid(cfg)
-    spec = gen.extract_shape("shapes/star.svg", 512)
+    spec = gen.extract_shape(shape_path("star"), 512)
     cand = search_placement(spec.outer, lattice, cfg)[0]
     check(len(cand.route) > 10, "pipeline smoke: star routes on the lattice")
     check(is_connected_walk(cand.route, lattice.graph),
@@ -99,8 +100,8 @@ def main():
 def dispatch_checks():
     """Engine dispatch: compactness separates the families and auto routes
     compact shapes to the recipe engine, protrusive ones to classic."""
-    heart = gen.extract_contour("shapes/heart.svg", 512)
-    star = gen.extract_contour("shapes/star.svg", 512)
+    heart = gen.extract_contour(shape_path("heart"), 512)
+    star = gen.extract_contour(shape_path("star"), 512)
     c_heart, c_star = gen.shape_compactness(heart), gen.shape_compactness(star)
     check(c_heart < 2.0 < c_star,
           f"compactness separates heart ({c_heart:.2f}) from star ({c_star:.2f})")

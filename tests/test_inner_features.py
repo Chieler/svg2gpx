@@ -9,14 +9,12 @@ Covers the three feature kinds and backward compatibility:
   * extract_contour still returns exactly the outer outline of extract_shape.
 """
 
-import os
-
 import numpy as np
 
-from gen import extract_contour, extract_shape
+from svg2gpx.gen import extract_contour, extract_shape
+from svg2gpx.shapes import shape_path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SVG = lambda name: os.path.join(HERE, "shapes", f"{name}.svg")
+SVG = shape_path
 IMG = 1024
 
 
