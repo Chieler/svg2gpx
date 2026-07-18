@@ -2201,6 +2201,119 @@ def main(cfg=CONFIG):
     return grid, ranked
 
 
+@dataclass
+class RouteResult:
+    """The output of get_route: a runnable route that resembles the shape.
+
+    `latlon` is the main product -- the route as WGS84 (lat, lon) points on real
+    streets, a closed loop (last point == first). The rest is there for
+    inspection and export.
+    """
+    latlon: np.ndarray       # (N, 2) route as (lat, lon), a closed loop
+    distance_km: float       # route length on the ground
+    iou: float               # area-overlap fidelity vs the placed shape
+    frechet: float           # worst-case adherence to the placed shape
+    features_latlon: list    # [(M_i, 2) (lat, lon), ...] routed inner features
+    candidate: "Candidate"   # full pipeline object (placed contour, raw route, ...)
+    grid: "Grid"             # the street grid it was routed on
+
+    def to_gpx(self, path, name="svg2gpx route"):
+        """Write the route to a GPX file (Strava / Garmin / Komoot-ready)."""
+        from .gpx import to_gpx as _to_gpx
+        return _to_gpx(self.latlon, path, name=name)
+
+
+def get_route(lat, lng, svg, *, radius_m=None, granularity=None, seed=None,
+              graphml=None, inner_features=None, engine=None,
+              verbose=False, **overrides):
+    """Generate a runnable street route that resembles an SVG shape.
+
+    The one-call library entry point: give it a location and a shape, get back a
+    route on real streets you can run or export to GPX.
+
+        from svg2gpx import get_route
+        route = get_route(41.9285, -87.7075, "star")       # a bundled shape
+        route = get_route(41.9285, -87.7075, "mine.svg")   # or your own SVG
+        route.to_gpx("star.gpx")
+        print(route.distance_km, route.iou)
+        coords = route.latlon                              # (N, 2) lat/lon
+
+    Parameters
+    ----------
+    lat, lng : float
+        Center of the street network to route on (WGS84).
+    svg : str
+        A bundled shape stem ("star", "Horse", "donut", ... -- see
+        `bundled_shapes()`) or a path to your own SVG file.
+    radius_m : float, optional
+        Network radius in metres. Bigger = higher fidelity, longer route.
+    granularity : float, optional
+        0 = smooth / short, 1 = trace every jog.
+    seed : int, optional
+        Placement-search RNG seed, for reproducible routes.
+    graphml : str, optional
+        Path to a saved OSMnx GraphML network to route on instead of fetching
+        live from OpenStreetMap (offline / reproducible).
+    inner_features : bool, optional
+        Also route the shape's inner features (eyes, holes). Default on.
+    engine : str, optional
+        Force an engine ("recipe", "classic", ...); default "auto".
+    verbose : bool
+        Print pipeline progress. Default False (quiet, library-friendly).
+    **overrides
+        Any other CONFIG key (see `svg2gpx.CONFIG`).
+
+    Returns
+    -------
+    RouteResult
+        `.latlon` (the route as lat/lon), `.distance_km`, `.iou`, `.frechet`,
+        `.to_gpx(path)`, plus `.candidate` / `.grid` for advanced use.
+
+    Real-network routing needs the 'osm' extra: `pip install 'svg2gpx[osm]'`.
+    """
+    import contextlib
+    import io
+
+    cfg = dict(CONFIG)
+    cfg["lat"], cfg["lng"] = lat, lng
+    cfg["svg_path"] = shape_path(svg)
+    for key, val in [("radius_m", radius_m), ("granularity", granularity),
+                     ("seed", seed), ("graphml_path", graphml),
+                     ("inner_features", inner_features), ("engine", engine)]:
+        if val is not None:
+            cfg[key] = val
+    cfg.update(overrides)
+
+    def run():
+        grid = build_grid(cfg)
+        spec = extract_shape(cfg["svg_path"], cfg["img_size"],
+                             min_perimeter=cfg["inner_min_perimeter"])
+        inners = spec.inners if cfg.get("inner_features", True) else []
+        return grid, search_placement(spec.outer, grid, cfg, inners=inners)
+
+    if verbose:
+        grid, ranked = run()
+    else:
+        with contextlib.redirect_stdout(io.StringIO()):
+            grid, ranked = run()
+
+    if not ranked or len(ranked[0].route) < 3:
+        raise RuntimeError(
+            "no routable placement found -- the shape may not fit this network "
+            "(try a larger radius_m, a different lat/lng, or another shape)")
+    best = ranked[0]
+    feats_ll = [to_lonlat(fr, grid) for _, _, fr in best.feats if len(fr) >= 2]
+    return RouteResult(
+        latlon=to_lonlat(best.route, grid),
+        distance_km=route_length_m(best.route, grid) / 1000.0,
+        iou=float(iou(best.route, best.placed, 0.01)),
+        frechet=float(frechet(best.route, best.placed)),
+        features_latlon=feats_ll,
+        candidate=best,
+        grid=grid,
+    )
+
+
 def _cli(argv=None):
     """Command-line overrides for CONFIG, so a run like 'trace the star over
     Chicago and save the plot' needs no source edits."""

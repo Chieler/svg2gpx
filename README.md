@@ -74,6 +74,25 @@ svg2gpx --svg star --lat 41.9285 --lng -87.7075 --save star.png --gpx star.gpx
 a path to your own SVG. `star.gpx` is ready to import into Strava, Garmin, or
 Komoot.
 
+## 🐍 Use it from Python
+
+One call: give it a location and a shape, get a route back.
+
+```python
+from svg2gpx import get_route
+
+route = get_route(41.9285, -87.7075, "star")   # lat, lng, shape (stem or .svg path)
+
+route.to_gpx("star.gpx")                        # Strava / Garmin / Komoot-ready
+print(route.distance_km, route.iou)             # 10.8, 0.33
+coords = route.latlon                           # (N, 2) array of (lat, lon)
+```
+
+Common options: `radius_m` (bigger = higher fidelity, longer route),
+`granularity` (0 smooth … 1 detailed), `seed` (reproducible), `graphml` (route on
+a saved OSMnx network, offline), `engine`, or any [`CONFIG`](src/svg2gpx/gen.py)
+key as a keyword. Requires the `[osm]` extra.
+
 ## 🖼️ Gallery
 
 Pick the placement that reads best, tune detail, or let the shape choose its own

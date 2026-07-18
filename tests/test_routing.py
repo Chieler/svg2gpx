@@ -93,8 +93,50 @@ def main():
 
     ledger_checks()
     dispatch_checks()
+    get_route_checks()
 
     print("\nall routing checks passed")
+
+
+def get_route_checks():
+    """The get_route() library entry point: API surface always; a real route
+    when osmnx + a cached GraphML are available (skipped cleanly otherwise, so
+    the offline test suite still passes)."""
+    import os
+    import svg2gpx
+
+    check(callable(svg2gpx.get_route), "get_route is exported and callable")
+    fields = svg2gpx.RouteResult.__dataclass_fields__
+    for f in ("latlon", "distance_km", "iou", "frechet", "features_latlon"):
+        check(f in fields, f"RouteResult has field '{f}'")
+
+    # A bad shape fails fast (before any network work), with a clear error.
+    try:
+        svg2gpx.get_route(0.0, 0.0, "definitely_not_a_shape_xyz")
+        check(False, "get_route should reject an unknown shape")
+    except FileNotFoundError:
+        check(True, "get_route rejects an unknown shape with FileNotFoundError")
+
+    graphml = os.path.join("data", "Chicago_Network.graphml")
+    try:
+        import osmnx  # noqa: F401
+    except ImportError:
+        print("  skip: osmnx not installed -- get_route network smoke skipped")
+        return
+    if not os.path.exists(graphml):
+        print(f"  skip: {graphml} not found -- get_route network smoke skipped")
+        return
+
+    route = svg2gpx.get_route(41.9285, -87.7075, "star", graphml=graphml,
+                              radius_m=1600, seed=42)
+    check(isinstance(route, svg2gpx.RouteResult), "get_route returns a RouteResult")
+    check(route.latlon.ndim == 2 and route.latlon.shape[1] == 2,
+          "get_route .latlon is an (N, 2) lat/lon array")
+    check(bool((route.latlon[0] == route.latlon[-1]).all()),
+          "get_route route is a closed loop")
+    check(route.distance_km > 0, f"get_route distance_km positive ({route.distance_km:.1f})")
+    check(-90 <= route.latlon[:, 0].min() and route.latlon[:, 0].max() <= 90,
+          "get_route latitudes are in range")
 
 
 def dispatch_checks():
