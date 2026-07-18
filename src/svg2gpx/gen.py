@@ -2222,24 +2222,31 @@ class RouteResult:
         from .gpx import to_gpx as _to_gpx
         return _to_gpx(self.latlon, path, name=name)
 
-    def plot(self, ax=None, target=True, features=True, save=None, show=None):
-        """Quick look at the route: the runnable path (orange) over the target
-        shape it traces (dashed), plus any inner-feature routes.
+    def plot(self, ax=None, streets=True, target=True, features=True,
+             save=None, show=None):
+        """Quick look at the route: the runnable path (orange) over the street
+        grid it runs on and the target shape it traces (dashed), plus any
+        inner-feature routes.
 
         Drawn in the pipeline's normalized coordinates with equal aspect, so the
-        figure reads undistorted -- the question is "does this look like the
-        shape", not "where is it on the map" (use chicago_map for streets).
-        With no `save` and no `ax`, it opens a window; pass `save="out.png"` to
-        write a file headlessly. Returns the matplotlib Axes.
+        figure reads undistorted. `streets=True` (default) shows the street grid
+        the route follows; set it False for just the shape. With no `save` and no
+        `ax`, it opens a window; pass `save="out.png"` to write a file
+        headlessly. Returns the matplotlib Axes.
         """
         try:
             import matplotlib.pyplot as plt
+            from matplotlib.collections import LineCollection
         except ImportError as exc:
             raise ImportError("plotting needs matplotlib: "
                               "pip install 'svg2gpx[osm]'") from exc
         cand = self.candidate
         if ax is None:
             _, ax = plt.subplots(figsize=(6, 6))
+        if streets and self.grid.edge_list:
+            ax.add_collection(LineCollection(
+                [[p1, p2] for p1, p2 in self.grid.edge_list],
+                colors="#8aa0b8", linewidths=0.5, alpha=0.35, zorder=1))
         if target:
             p = np.asarray(cand.placed)
             ax.plot(p[:, 0], p[:, 1], "--", color="#5b6abf", lw=1.4, alpha=0.8,
