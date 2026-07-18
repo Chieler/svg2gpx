@@ -74,7 +74,12 @@ def build_grid(cfg):
         same lat/lng + radius_m window. This makes real-map runs reproducible
         and usable where the Overpass API is slow, rate-limited or unreachable.
     """
-    import osmnx as ox
+    try:
+        import osmnx as ox
+    except ImportError as exc:
+        raise ImportError(
+            "real-network routing needs the 'osm' extra: "
+            "pip install 'svg2gpx[osm]'") from exc
     if cfg.get("graphml_path"):
         G = ox.load_graphml(cfg["graphml_path"])
         bbox = ox.utils_geo.bbox_from_point((cfg["lat"], cfg["lng"]),
