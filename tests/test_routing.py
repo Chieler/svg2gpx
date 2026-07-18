@@ -9,9 +9,10 @@ disconnected graph, and an end-to-end pipeline smoke on the synthetic lattice.
 import numpy as np
 from scipy.spatial import cKDTree
 
-import gen
-from gen import Grid, route_contour, route_pair, search_placement
-from benchmark import synthetic_grid
+from svg2gpx import gen
+from svg2gpx.gen import Grid, route_contour, route_pair, search_placement
+from svg2gpx.benchmark import synthetic_grid
+from svg2gpx.shapes import shape_path
 
 
 def check(cond, msg):
@@ -83,7 +84,7 @@ def main():
     cfg.update(grid_size=30, grid_diagonals=True, n_random=300, n_refine=100,
                n_route_eval=2, inner_features=False)
     lattice = synthetic_grid(cfg)
-    spec = gen.extract_shape("shapes/star.svg", 512)
+    spec = gen.extract_shape(shape_path("star"), 512)
     cand = search_placement(spec.outer, lattice, cfg)[0]
     check(len(cand.route) > 10, "pipeline smoke: star routes on the lattice")
     check(is_connected_walk(cand.route, lattice.graph),
@@ -92,15 +93,57 @@ def main():
 
     ledger_checks()
     dispatch_checks()
+    get_route_checks()
 
     print("\nall routing checks passed")
+
+
+def get_route_checks():
+    """The get_route() library entry point: API surface always; a real route
+    when osmnx + a cached GraphML are available (skipped cleanly otherwise, so
+    the offline test suite still passes)."""
+    import os
+    import svg2gpx
+
+    check(callable(svg2gpx.get_route), "get_route is exported and callable")
+    fields = svg2gpx.RouteResult.__dataclass_fields__
+    for f in ("latlon", "distance_km", "iou", "frechet", "features_latlon"):
+        check(f in fields, f"RouteResult has field '{f}'")
+
+    # A bad shape fails fast (before any network work), with a clear error.
+    try:
+        svg2gpx.get_route(0.0, 0.0, "definitely_not_a_shape_xyz")
+        check(False, "get_route should reject an unknown shape")
+    except FileNotFoundError:
+        check(True, "get_route rejects an unknown shape with FileNotFoundError")
+
+    graphml = os.path.join("data", "Chicago_Network.graphml")
+    try:
+        import osmnx  # noqa: F401
+    except ImportError:
+        print("  skip: osmnx not installed -- get_route network smoke skipped")
+        return
+    if not os.path.exists(graphml):
+        print(f"  skip: {graphml} not found -- get_route network smoke skipped")
+        return
+
+    route = svg2gpx.get_route(41.9285, -87.7075, "star", graphml=graphml,
+                              radius_m=1600, seed=42)
+    check(isinstance(route, svg2gpx.RouteResult), "get_route returns a RouteResult")
+    check(route.latlon.ndim == 2 and route.latlon.shape[1] == 2,
+          "get_route .latlon is an (N, 2) lat/lon array")
+    check(bool((route.latlon[0] == route.latlon[-1]).all()),
+          "get_route route is a closed loop")
+    check(route.distance_km > 0, f"get_route distance_km positive ({route.distance_km:.1f})")
+    check(-90 <= route.latlon[:, 0].min() and route.latlon[:, 0].max() <= 90,
+          "get_route latitudes are in range")
 
 
 def dispatch_checks():
     """Engine dispatch: compactness separates the families and auto routes
     compact shapes to the recipe engine, protrusive ones to classic."""
-    heart = gen.extract_contour("shapes/heart.svg", 512)
-    star = gen.extract_contour("shapes/star.svg", 512)
+    heart = gen.extract_contour(shape_path("heart"), 512)
+    star = gen.extract_contour(shape_path("star"), 512)
     c_heart, c_star = gen.shape_compactness(heart), gen.shape_compactness(star)
     check(c_heart < 2.0 < c_star,
           f"compactness separates heart ({c_heart:.2f}) from star ({c_star:.2f})")

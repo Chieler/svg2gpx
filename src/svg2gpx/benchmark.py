@@ -35,8 +35,8 @@ import time
 import numpy as np
 from scipy.spatial import cKDTree
 
-import gen
-from gen import (
+from . import gen
+from .gen import (
     Grid,
     dtw,
     extract_contour,
@@ -53,8 +53,9 @@ from gen import (
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHAPES_DIR = os.path.join(HERE, "shapes")
-CACHE_DIR = os.path.join(HERE, ".cache", "grids")
+SHAPES_DIR = os.path.join(HERE, "shapes")   # bundled read-only package data
+# A run artifact, not package data -- cache next to where the tool runs (cwd).
+CACHE_DIR = os.path.join(".cache", "grids")
 
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +261,7 @@ def main():
     ap.add_argument("--no-diagonals", action="store_true",
                     help="synthetic lattice without 45 deg links")
     ap.add_argument("--shapes", default=SHAPES_DIR, help="directory of *.svg shapes")
-    ap.add_argument("--out", default=os.path.join(HERE, "benchmark_results.csv"),
+    ap.add_argument("--out", default="benchmark_results.csv",
                     help="CSV output path")
     ap.add_argument("--json", action="store_true", help="also write JSON results")
     args = ap.parse_args()

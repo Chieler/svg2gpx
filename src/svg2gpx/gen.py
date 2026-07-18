@@ -32,6 +32,8 @@ import numpy as np
 import cv2
 import skia
 from scipy.spatial import cKDTree
+
+from .shapes import shape_path
 from shapely.geometry import LinearRing, LineString
 
 # osmnx (live OSM fetch) and matplotlib (plotting) are imported lazily inside the
@@ -58,6 +60,8 @@ class Grid:
     x_min: float
     y_min: float
     grid_angle: float    # dominant street orientation, radians (period 90 deg)
+    crs: str = None      # the source graph's projected CRS, for to_lonlat();
+                         # None on the synthetic grid (no real-world location)
 
 
 def build_grid(cfg):
@@ -70,7 +74,12 @@ def build_grid(cfg):
         same lat/lng + radius_m window. This makes real-map runs reproducible
         and usable where the Overpass API is slow, rate-limited or unreachable.
     """
-    import osmnx as ox
+    try:
+        import osmnx as ox
+    except ImportError as exc:
+        raise ImportError(
+            "real-network routing needs the 'osm' extra: "
+            "pip install 'svg2gpx[osm]'") from exc
     if cfg.get("graphml_path"):
         G = ox.load_graphml(cfg["graphml_path"])
         bbox = ox.utils_geo.bbox_from_point((cfg["lat"], cfg["lng"]),
@@ -80,6 +89,24 @@ def build_grid(cfg):
         G = ox.graph_from_point((cfg["lat"], cfg["lng"]), dist=cfg["radius_m"],
                                 network_type="walk", simplify=True)
     return grid_from_graph(ox.project_graph(G), cfg)
+
+
+def to_lonlat(pts01, grid):
+    """[0, 1] pipeline coords -> WGS84 (lat, lon) pairs, for GPX/GeoJSON export.
+
+    Only meaningful for a grid built from a real network (grid.crs set by
+    build_grid/grid_from_graph); the synthetic benchmark grid has no
+    real-world location and raises.
+    """
+    if not grid.crs:
+        raise ValueError("this grid has no CRS (synthetic grid?) -- "
+                         "geographic export needs a real-network grid")
+    from pyproj import Transformer
+    pts = np.asarray(pts01, dtype=np.float64)
+    proj = pts * grid.span + np.array([grid.x_min, grid.y_min])
+    tf = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+    lon, lat = tf.transform(proj[:, 0], proj[:, 1])
+    return np.column_stack([lat, lon])
 
 
 def grid_from_graph(G_proj, cfg):
@@ -143,7 +170,8 @@ def grid_from_graph(G_proj, cfg):
     print(f"grid: {len(node_keys)} nodes, {len(edge_list)} edges, "
           f"avg edge {avg_edge:.4f}, grid angle {np.degrees(grid_angle):.1f} deg")
     return Grid(graph, node_keys, nodes_arr, cKDTree(nodes_arr),
-                avg_edge, edge_list, span, x_min, y_min, grid_angle)
+                avg_edge, edge_list, span, x_min, y_min, grid_angle,
+                crs=str(G_proj.graph["crs"]))
 
 
 def _dominant_orientation(edge_list, sample=6000):
@@ -1896,7 +1924,7 @@ def _report(label, grid, cand):
 # CONFIG                                                                       #
 # --------------------------------------------------------------------------- #
 CONFIG = dict(
-    svg_path="shapes/star.svg",   # any of the bundled shapes/*.svg, or your own
+    svg_path=shape_path("star"),  # a bundled stem, or a path to your own SVG
     # Street network location (default: midtown Manhattan).
     lat=40.7527,
     lng=-73.9943,
@@ -2116,6 +2144,11 @@ ENGINE_PANELS = ["classic-faithful", "classic-simple", "classic-efficient",
 
 
 def main(cfg=CONFIG):
+    """Run the full pipeline. Returns (grid, candidates) -- candidates is the
+    ranked Candidate list (or, in "engines" mode, one per engine panel), and
+    grid is included so callers (e.g. the CLI's --gpx export) can convert a
+    candidate's route to real-world coordinates via to_lonlat() without
+    re-running the placement search."""
     grid = build_grid(cfg)
     spec = extract_shape(cfg["svg_path"], cfg["img_size"],
                          min_perimeter=cfg["inner_min_perimeter"])
@@ -2138,7 +2171,7 @@ def main(cfg=CONFIG):
         for label, cand in panels:
             _report(label, grid, cand)
         plot_options(grid, panels, save=save, show=show)
-        return [cand for _, cand in panels]
+        return grid, [cand for _, cand in panels]
 
     ranked = search_placement(contour, grid, cfg, inners=inners)   # [Candidate, ...]
     best = ranked[0]
@@ -2146,7 +2179,7 @@ def main(cfg=CONFIG):
     if not cfg.get("present_options"):
         _report("route", grid, best)
         plot(grid, best.placed, best.route, feats=best.feats, save=save, show=show)
-        return ranked
+        return grid, ranked
 
     if cfg["option_mode"] == "placements":
         # Different placements per panel -- pick the one whose street angles read best.
@@ -2165,7 +2198,168 @@ def main(cfg=CONFIG):
     for label, cand in panels:
         _report(label, grid, cand)
     plot_options(grid, panels, save=save, show=show)
-    return ranked
+    return grid, ranked
+
+
+@dataclass
+class RouteResult:
+    """The output of get_route: a runnable route that resembles the shape.
+
+    `latlon` is the main product -- the route as WGS84 (lat, lon) points on real
+    streets, a closed loop (last point == first). The rest is there for
+    inspection and export.
+    """
+    latlon: np.ndarray       # (N, 2) route as (lat, lon), a closed loop
+    distance_km: float       # route length on the ground
+    iou: float               # area-overlap fidelity vs the placed shape
+    frechet: float           # worst-case adherence to the placed shape
+    features_latlon: list    # [(M_i, 2) (lat, lon), ...] routed inner features
+    candidate: "Candidate"   # full pipeline object (placed contour, raw route, ...)
+    grid: "Grid"             # the street grid it was routed on
+
+    def to_gpx(self, path, name="svg2gpx route"):
+        """Write the route to a GPX file (Strava / Garmin / Komoot-ready)."""
+        from .gpx import to_gpx as _to_gpx
+        return _to_gpx(self.latlon, path, name=name)
+
+    def plot(self, ax=None, streets=True, target=True, features=True,
+             save=None, show=None):
+        """Quick look at the route: the runnable path (orange) over the street
+        grid it runs on and the target shape it traces (dashed), plus any
+        inner-feature routes.
+
+        Drawn in the pipeline's normalized coordinates with equal aspect, so the
+        figure reads undistorted. `streets=True` (default) shows the street grid
+        the route follows; set it False for just the shape. With no `save` and no
+        `ax`, it opens a window; pass `save="out.png"` to write a file
+        headlessly. Returns the matplotlib Axes.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.collections import LineCollection
+        except ImportError as exc:
+            raise ImportError("plotting needs matplotlib: "
+                              "pip install 'svg2gpx[osm]'") from exc
+        cand = self.candidate
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 6))
+        if streets and self.grid.edge_list:
+            ax.add_collection(LineCollection(
+                [[p1, p2] for p1, p2 in self.grid.edge_list],
+                colors="#8aa0b8", linewidths=0.5, alpha=0.35, zorder=1))
+        if target:
+            p = np.asarray(cand.placed)
+            ax.plot(p[:, 0], p[:, 1], "--", color="#5b6abf", lw=1.4, alpha=0.8,
+                    label="target shape")
+        r = np.asarray(cand.route)
+        ax.plot(r[:, 0], r[:, 1], color="#e4572e", lw=2.4,
+                solid_capstyle="round", label="route")
+        ax.scatter(*r[0], color="#2e933c", s=45, zorder=5, label="start")
+        if features:
+            for _, _, fr in cand.feats:
+                if len(fr) >= 2:
+                    f = np.asarray(fr)
+                    ax.plot(f[:, 0], f[:, 1], color="#e88b2e", lw=1.8, zorder=4)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(f"{self.distance_km:.1f} km   IoU {self.iou:.2f}")
+        ax.legend(loc="upper right", fontsize=8, frameon=False)
+        if save:
+            ax.figure.savefig(save, dpi=120, bbox_inches="tight")
+        if show or (show is None and save is None):
+            plt.show()
+        return ax
+
+
+def get_route(lat, lng, svg, *, radius_m=None, granularity=None, seed=None,
+              graphml=None, inner_features=None, engine=None,
+              verbose=False, **overrides):
+    """Generate a runnable street route that resembles an SVG shape.
+
+    The one-call library entry point: give it a location and a shape, get back a
+    route on real streets you can run or export to GPX.
+
+        from svg2gpx import get_route
+        route = get_route(41.9285, -87.7075, "star")       # a bundled shape
+        route = get_route(41.9285, -87.7075, "mine.svg")   # or your own SVG
+        route.to_gpx("star.gpx")
+        print(route.distance_km, route.iou)
+        coords = route.latlon                              # (N, 2) lat/lon
+
+    Parameters
+    ----------
+    lat, lng : float
+        Center of the street network to route on (WGS84).
+    svg : str
+        A bundled shape stem ("star", "Horse", "donut", ... -- see
+        `bundled_shapes()`) or a path to your own SVG file.
+    radius_m : float, optional
+        Network radius in metres. Bigger = higher fidelity, longer route.
+    granularity : float, optional
+        0 = smooth / short, 1 = trace every jog.
+    seed : int, optional
+        Placement-search RNG seed, for reproducible routes.
+    graphml : str, optional
+        Path to a saved OSMnx GraphML network to route on instead of fetching
+        live from OpenStreetMap (offline / reproducible).
+    inner_features : bool, optional
+        Also route the shape's inner features (eyes, holes). Default on.
+    engine : str, optional
+        Force an engine ("recipe", "classic", ...); default "auto".
+    verbose : bool
+        Print pipeline progress. Default False (quiet, library-friendly).
+    **overrides
+        Any other CONFIG key (see `svg2gpx.CONFIG`).
+
+    Returns
+    -------
+    RouteResult
+        `.latlon` (the route as lat/lon), `.distance_km`, `.iou`, `.frechet`,
+        `.to_gpx(path)`, plus `.candidate` / `.grid` for advanced use.
+
+    Real-network routing needs the 'osm' extra: `pip install 'svg2gpx[osm]'`.
+    """
+    import contextlib
+    import io
+
+    cfg = dict(CONFIG)
+    cfg["lat"], cfg["lng"] = lat, lng
+    cfg["svg_path"] = shape_path(svg)
+    for key, val in [("radius_m", radius_m), ("granularity", granularity),
+                     ("seed", seed), ("graphml_path", graphml),
+                     ("inner_features", inner_features), ("engine", engine)]:
+        if val is not None:
+            cfg[key] = val
+    cfg.update(overrides)
+
+    def run():
+        grid = build_grid(cfg)
+        spec = extract_shape(cfg["svg_path"], cfg["img_size"],
+                             min_perimeter=cfg["inner_min_perimeter"])
+        inners = spec.inners if cfg.get("inner_features", True) else []
+        return grid, search_placement(spec.outer, grid, cfg, inners=inners)
+
+    if verbose:
+        grid, ranked = run()
+    else:
+        with contextlib.redirect_stdout(io.StringIO()):
+            grid, ranked = run()
+
+    if not ranked or len(ranked[0].route) < 3:
+        raise RuntimeError(
+            "no routable placement found -- the shape may not fit this network "
+            "(try a larger radius_m, a different lat/lng, or another shape)")
+    best = ranked[0]
+    feats_ll = [to_lonlat(fr, grid) for _, _, fr in best.feats if len(fr) >= 2]
+    return RouteResult(
+        latlon=to_lonlat(best.route, grid),
+        distance_km=route_length_m(best.route, grid) / 1000.0,
+        iou=float(iou(best.route, best.placed, 0.01)),
+        frechet=float(frechet(best.route, best.placed)),
+        features_latlon=feats_ll,
+        candidate=best,
+        grid=grid,
+    )
 
 
 def _cli(argv=None):
@@ -2173,7 +2367,8 @@ def _cli(argv=None):
     Chicago and save the plot' needs no source edits."""
     import argparse
     ap = argparse.ArgumentParser(description="SVG -> running route on real streets.")
-    ap.add_argument("--svg", help="path to the shape SVG")
+    ap.add_argument("--svg", help="a bundled shape stem (e.g. 'star') or a path "
+                                  "to your own SVG")
     ap.add_argument("--lat", type=float, help="network center latitude")
     ap.add_argument("--lng", type=float, help="network center longitude")
     ap.add_argument("--radius", type=float, dest="radius_m",
@@ -2192,6 +2387,8 @@ def _cli(argv=None):
     args = ap.parse_args(argv)
 
     cfg = dict(CONFIG)
+    if args.svg is not None:
+        args.svg = shape_path(args.svg)
     for key, val in [("svg_path", args.svg), ("lat", args.lat), ("lng", args.lng),
                      ("radius_m", args.radius_m), ("graphml_path", args.graphml),
                      ("granularity", args.granularity), ("seed", args.seed),

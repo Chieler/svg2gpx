@@ -36,8 +36,8 @@ import urllib.request
 import networkx as nx
 import numpy as np
 
-import gen
-from gen import (
+from . import gen
+from .gen import (
     dtw,
     extract_shape,
     feature_run_length_m,
@@ -53,8 +53,10 @@ from gen import (
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHAPES_DIR = os.path.join(HERE, "shapes")
-DATA_DIR = os.path.join(HERE, "data")
+SHAPES_DIR = os.path.join(HERE, "shapes")   # bundled read-only package data
+# Downloaded/cached data is a run artifact, not package data -- keep it next to
+# where the tool runs (cwd), not inside the installed package tree.
+DATA_DIR = "data"
 GRAPHML_PATH = os.path.join(DATA_DIR, "Chicago_Network.graphml")
 GRAPHML_URL = ("https://raw.githubusercontent.com/cybergis/"
                "COVID-19AccessibilityNotebook/main/data/Chicago_Network.graphml")
@@ -280,7 +282,7 @@ def main():
     ap.add_argument("--no-inner-features", action="store_true",
                     help="outline only: skip placing/routing/scoring the "
                          "shapes' inner features")
-    ap.add_argument("--outdir", default=os.path.join(HERE, "chicago_maps"))
+    ap.add_argument("--outdir", default="chicago_maps")
     args = ap.parse_args()
 
     if args.shape == "all":
