@@ -10,6 +10,9 @@
   <img src="https://img.shields.io/badge/License-MIT-2ea44f" alt="License: MIT">
   <img src="https://img.shields.io/badge/PRs-welcome-ff69b4" alt="PRs welcome">
   <img src="https://img.shields.io/badge/built%20with-NumPy%20·%20SciPy%20·%20Shapely%20·%20OSMnx-f7931e" alt="Built with NumPy, SciPy, Shapely, OSMnx">
+  <a href="https://pypi.org/project/svg2gpx/">
+    <img src="https://img.shields.io/pypi/v/svg2gpx" alt="PyPI Version">
+  </a>
 </p>
 
 <p align="center">
