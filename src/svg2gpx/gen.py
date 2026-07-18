@@ -2222,6 +2222,47 @@ class RouteResult:
         from .gpx import to_gpx as _to_gpx
         return _to_gpx(self.latlon, path, name=name)
 
+    def plot(self, ax=None, target=True, features=True, save=None, show=None):
+        """Quick look at the route: the runnable path (orange) over the target
+        shape it traces (dashed), plus any inner-feature routes.
+
+        Drawn in the pipeline's normalized coordinates with equal aspect, so the
+        figure reads undistorted -- the question is "does this look like the
+        shape", not "where is it on the map" (use chicago_map for streets).
+        With no `save` and no `ax`, it opens a window; pass `save="out.png"` to
+        write a file headlessly. Returns the matplotlib Axes.
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise ImportError("plotting needs matplotlib: "
+                              "pip install 'svg2gpx[osm]'") from exc
+        cand = self.candidate
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 6))
+        if target:
+            p = np.asarray(cand.placed)
+            ax.plot(p[:, 0], p[:, 1], "--", color="#5b6abf", lw=1.4, alpha=0.8,
+                    label="target shape")
+        r = np.asarray(cand.route)
+        ax.plot(r[:, 0], r[:, 1], color="#e4572e", lw=2.4,
+                solid_capstyle="round", label="route")
+        ax.scatter(*r[0], color="#2e933c", s=45, zorder=5, label="start")
+        if features:
+            for _, _, fr in cand.feats:
+                if len(fr) >= 2:
+                    f = np.asarray(fr)
+                    ax.plot(f[:, 0], f[:, 1], color="#e88b2e", lw=1.8, zorder=4)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(f"{self.distance_km:.1f} km   IoU {self.iou:.2f}")
+        ax.legend(loc="upper right", fontsize=8, frameon=False)
+        if save:
+            ax.figure.savefig(save, dpi=120, bbox_inches="tight")
+        if show or (show is None and save is None):
+            plt.show()
+        return ax
+
 
 def get_route(lat, lng, svg, *, radius_m=None, granularity=None, seed=None,
               graphml=None, inner_features=None, engine=None,

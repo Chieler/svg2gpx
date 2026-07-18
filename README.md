@@ -84,6 +84,7 @@ from svg2gpx import get_route
 route = get_route(41.9285, -87.7075, "star")   # lat, lng, shape (stem or .svg path)
 
 route.to_gpx("star.gpx")                        # Strava / Garmin / Komoot-ready
+route.plot()                                    # quick matplotlib look (or save="star.png")
 print(route.distance_km, route.iou)             # 10.8, 0.33
 coords = route.latlon                           # (N, 2) array of (lat, lon)
 ```
